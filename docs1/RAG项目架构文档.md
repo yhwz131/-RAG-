@@ -1,15 +1,16 @@
-# 知识问答系统 架构设计文档 v2.1
+# 知识问答系统 架构设计文档 v3.0
 
 ## 文档信息
 
 | 项目 | 内容 |
 |------|------|
 | **文档名称** | 知识问答系统架构设计文档 |
-| **版本** | v2.1 |
-| **更新日期** | 2026-06-19 |
+| **版本** | v3.0 |
+| **更新日期** | 2026-06-20 |
 | **仓库地址** | [https://github.com/yhwz131/-RAG-](https://github.com/yhwz131/-RAG-) |
 | **技术栈** | FastAPI + Vue 3 + Milvus + RAG |
 | **描述** | 基于 RAG 的多模态知识问答系统整体架构设计 |
+| **分支策略** | `main` (稳定版) / `graduation-project` (毕业设计开发分支) |
 
 ---
 
@@ -26,6 +27,7 @@
 | **智能问答** | 基于 RAG 的上下文增强问答，支持流式输出 |
 | **查询路由** | 规则 + LLM 混合路由，自动区分 rag/chitchat/general 三类查询 |
 | **文档管理** | 批量上传、解析、切片、向量化入库，文件大小校验，失败自动清理 |
+| **数据管线** | 三种处理引擎（快速/Spark 批量/数据库导入），文件级去重，自动入库 |
 | **多模态检索** | 纯文本链路 (bge-large-zh) + 多模态链路 (Qwen3-VL-Embedding) |
 | **混合检索** | 向量检索 + BM25 关键词检索 + RRF 融合排序，相似度阈值过滤 |
 | **对话记忆** | 多轮对话上下文管理，轮次 + token 双重截断，会话持久化 |
@@ -56,10 +58,10 @@
 │  │  组件初始化   │  │ 流式/非流式   │  │ 上传/列表/删除        │   │
 │  │  静态文件托管 │  │ 会话管理      │  │ 批量上传              │   │
 │  └───────────────┘  └───────────────┘  └───────────────────────┘   │
-│  ┌───────────────┐                                                  │
-│  │ routes_health │                                                  │
-│  │ 健康检查      │                                                  │
-│  └───────────────┘                                                  │
+│  ┌───────────────┐  ┌───────────────────────────────────────────┐  │
+│  │ routes_health │  │ routes_pipeline                           │  │
+│  │ 健康检查      │  │ 数据管线：处理/状态/历史/数据库导入      │  │
+│  └───────────────┘  └───────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
                     │               │               │
         ┌───────────┘               │               └───────────┐
@@ -70,7 +72,22 @@
 │  rag/chain    │  │  embeddings/embedder      │  │  utils/           │
 │  rag/retriever│  │  embeddings/chunker       │  │  file_parser     │
 │  rag/memory   │  │                           │  │  logger          │
-│  rag/prompt   │  │                           │  │  spark/processor │
+│  rag/prompt   │  │                           │  │                  │
+│  rag/router   │  │                           │  │                  │
+└───────┬───────┘  └───────────┬───────────────┘  └──────────────────┘
+        │                      │
+        ▼                      ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│                    数据管线层 (Pipeline)                               │
+│  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────────┐  │
+│  │  SimpleEngine    │  │  SparkEngine      │  │  DatabaseSource     │  │
+│  │  快速单机处理    │  │  PySpark 批量处理  │  │  SQL 数据库导入     │  │
+│  │  文件级 MD5 去重 │  │  文件级 MD5 去重   │  │  表/SQL 查询导入    │  │
+│  └─────────────────┘  └──────────────────┘  └─────────────────────┘  │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │  PipelineService — 管线编排：保存文件 → 选引擎 → 处理 → 入库   │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────────┘
 └───────┬───────┘  └───────────┬───────────────┘  └──────────────────┘
         │                      │
         ▼                      ▼
@@ -103,7 +120,7 @@
 
 | 技术 | 版本 | 用途 |
 |------|------|------|
-| **Python** | 3.9+ | 主要编程语言 |
+| **Python** | 3.12 | 主要编程语言（conda env: kbqa） |
 | **FastAPI** | 0.104+ | Web API 框架 |
 | **Uvicorn** | 0.24+ | ASGI 服务器 |
 | **Pydantic** | 2.0+ | 数据验证与配置管理 |
@@ -117,6 +134,8 @@
 | **openpyxl** | 3.1+ | Excel 文件解析 |
 | **python-pptx** | 0.6+ | PPT 文件解析 |
 | **loguru** | 0.7+ | 日志管理 |
+| **PySpark** | 4.1.2 | 大数据批量处理引擎 |
+| **OpenJDK** | 17.0.2 | PySpark 运行时依赖（路径: /opt/jdk-17.0.2） |
 
 ### 2.2 前端技术栈
 
@@ -149,7 +168,18 @@ knowledge-qa-system/
 │   ├── main.py                     # FastAPI 入口，组件初始化，静态文件托管
 │   ├── routes_chat.py              # 对话接口（流式/非流式，会话管理）
 │   ├── routes_docs.py              # 文档管理接口（上传/批量上传/列表/删除）
-│   └── routes_health.py            # 健康检查接口
+│   ├── routes_health.py            # 健康检查接口
+│   ├── routes_pipeline.py          # 数据管线接口（处理/状态/历史/数据库导入）
+│   └── pipeline/                   # 管线模块
+│       ├── __init__.py
+│       ├── service.py              # 管线服务编排器（保存→选引擎→处理→入库）
+│       ├── schema.py               # 数据模型（PipelineResult, ChunkData, TaskStatus）
+│       ├── adapter.py              # 引擎抽象接口（PipelineEngine, DatabaseSource）
+│       └── engines/                # 处理引擎
+│           ├── __init__.py
+│           ├── simple.py           # 快速引擎：单机顺序处理 + 文件级 MD5 去重
+│           ├── spark_engine.py     # Spark 引擎：PySpark 并行处理 + 文件级 MD5 去重
+│           └── database.py         # 数据库引擎：SQL 表/查询导入
 │
 ├── config/                         # 配置管理
 │   ├── __init__.py
@@ -173,7 +203,7 @@ knowledge-qa-system/
 │   ├── file_parser.py              # 统一文件解析器（PDF/Word/PPT/Excel/TXT/MD）
 │   └── logger.py                   # 日志工具
 │
-├── spark/                          # Spark 大数据处理（可选）
+├── spark/                          # Spark 大数据处理（旧版，已被 pipeline/engines 替代）
 │   └── processor.py                # 批量数据处理
 │
 ├── web/                            # 旧版 Gradio 前端（已废弃）
@@ -181,14 +211,15 @@ knowledge-qa-system/
 │
 ├── frontend/                       # Vue 3 前端项目
 │   ├── src/
-│   │   ├── api/index.ts            # API 客户端封装
+│   │   ├── api/index.ts            # API 客户端封装（对话/文档/管线/健康检查）
 │   │   ├── views/
-│   │   │   ├── ChatView.vue        # 对话页面
-│   │   │   └── DocsView.vue        # 文档管理页面
+│   │   │   ├── ChatView.vue        # 对话页面（流式问答 + 会话管理）
+│   │   │   ├── DocsView.vue        # 文档管理页面（上传 + 管线统计 + 处理历史）
+│   │   │   └── AdminView.vue       # 管线状态页（已整合到 DocsView，/admin 重定向到 /files）
 │   │   ├── stores/
 │   │   │   ├── chat.ts             # 对话状态管理
-│   │   │   └── theme.ts            # 主题切换
-│   │   ├── router/index.ts         # 路由配置
+│n   │   │   └── theme.ts            # 主题切换
+│   │   ├── router/index.ts         # 路由配置（/chat, /files, /admin→/files）
 │   │   ├── App.vue                 # 根组件（导航栏 + 主题切换）
 │   │   ├── main.ts                 # 应用入口
 │   │   └── style.css               # 全局样式（暗黑/明亮双主题）
@@ -199,20 +230,23 @@ knowledge-qa-system/
 │
 ├── data/                           # 数据目录
 │   ├── raw/                        # 上传的原始文件
-│   ├── uploads/                    # 处理后的文件
-│   ├── processed/                  # 处理结果
+│   │   └── images/{file_id}/       # 文档提取的图片
+│   ├── uploads/                    # 待处理的暂存文件
+│   ├── processed/                  # 管线处理结果（chunks JSON）
+│   ├── staging/                    # 管线暂存区
 │   ├── sessions/                   # 会话持久化（JSON）
-│   └── milvus.db                   # Milvus Lite 本地数据库
+│   └── milvus.db/                  # Milvus Lite 本地数据库
+│       ├── LOCK                    # 文件锁（fcntl.flock，进程退出自动释放）
+│       └── collections/            # Collection 数据
 │
 ├── logs/                           # 日志目录
 │   ├── backend.log                 # 后端日志
 │   └── frontend.log                # 前端开发日志
 │
-├── docs/                           # 项目文档
-├── docs1/                          # 架构文档
+├── docs/                           # 项目设计文档
+├── docs1/                          # 架构与开发文档
 ├── .pids/                          # 进程 PID 文件（运行时生成）
-├── embeddings/                     # Embedding 模块
-├── start.sh                        # 启动脚本（start/stop/restart/status/logs）
+├── start.sh                        # 启动脚本 v3.0（start/stop/restart/status/logs）
 ├── requirements.txt                # Python 依赖
 ├── .env                            # 环境变量配置
 └── .env.example                    # 环境变量模板
@@ -401,14 +435,30 @@ knowledge-qa-system/
 | DELETE | `/api/docs/delete/{filename}` | 删除指定文档 |
 | DELETE | `/api/docs/clear` | 清空所有文档 |
 
-### 5.3 系统接口
+### 5.3 数据管线接口 `/api/pipeline`
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| POST | `/api/pipeline/process` | 提交处理任务（参数: engine=simple/spark） |
+| GET | `/api/pipeline/engines` | 获取可用处理引擎列表 |
+| GET | `/api/pipeline/status` | 获取管线状态（最近运行 + Milvus 统计） |
+| GET | `/api/pipeline/history` | 获取处理历史记录 |
+| GET | `/api/pipeline/tasks` | 获取所有任务列表 |
+| GET | `/api/pipeline/tasks/{id}` | 获取指定任务状态 |
+| GET | `/api/pipeline/quality` | 获取数据质量报告 |
+| GET | `/api/pipeline/database/status` | 获取数据库连接状态 |
+| GET | `/api/pipeline/database/tables` | 获取数据库表信息 |
+| POST | `/api/pipeline/database/test` | 测试数据库连接 |
+| POST | `/api/pipeline/database/import` | 从数据库导入数据 |
+
+### 5.4 系统接口
 
 | 方法 | 路径 | 描述 |
 |------|------|------|
 | GET | `/health` | 健康检查 |
 | GET | `/` | 前端页面（SPA） |
 
-### 5.4 流式响应协议
+### 5.5 流式响应协议
 
 流式对话采用自定义协议，先发送引用来源和查询类型，再逐 token 输出：
 
@@ -499,7 +549,8 @@ LOG_LEVEL=INFO
 | `/` | 重定向 | → `/chat` |
 | `/chat` | ChatView | 对话页面（欢迎页 + 快捷提问） |
 | `/chat/:sessionId` | ChatView | 指定会话 |
-| `/docs` | DocsView | 文档管理 |
+| `/files` | DocsView | 文档管理（上传 + 管线统计 + 处理历史 + 数据库导入） |
+| `/admin` | 重定向 | → `/files`（Admin 页面已整合到文档管理） |
 
 ### 7.2 状态管理 (Pinia)
 
@@ -544,7 +595,7 @@ uploadDocuments(files: File[]): Promise<BatchUploadResult>
 
 ## 8. 启动与部署
 
-### 8.1 一键启动脚本
+### 8.1 一键启动脚本 (v3.0)
 
 ```bash
 # 首次使用：安装依赖 + 构建前端
@@ -566,6 +617,12 @@ uploadDocuments(files: File[]): Promise<BatchUploadResult>
 ./start.sh logs
 ./start.sh logs backend
 ```
+
+**v3.0 改进：**
+- 自动配置 PySpark 环境变量（JAVA_HOME、PYSPARK_PYTHON）
+- 停止时先 SIGTERM → 等待 5 秒 → SIGKILL，确保 Milvus Lite 文件锁释放
+- 重启时额外等待 3 秒，避免文件锁竞争
+- 残留进程清理后验证锁已释放（`flock -n` 检测）
 
 ### 8.2 服务端口
 
@@ -603,18 +660,24 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000
 - `id` — 主键
 - `text` — 原始文本
 - `vector` — Embedding 向量
-- `source` — 来源文件名
+- `filename` — 来源文件名（管线导入时从 `source` 字段映射）
 - `page_number` — 页码
+
+> **注意**：管线引擎输出的 ChunkData 使用 `source` 字段，入库时通过 `_import_to_milvus()` 映射为 `filename`。管线导入前会先 `drop_collection()` 再重建，确保数据一致性。
 
 ### 9.2 文件存储
 
 | 目录 | 用途 |
 |------|------|
-| `data/raw/` | 上传的原始文件 |
-| `data/raw/images/{file_id}/` | PDF 提取的图片 |
-| `data/uploads/` | 处理后的文件 |
+| `data/raw/` | 上传的原始文件（按 UUID 前缀命名） |
+| `data/raw/images/{file_id}/` | PDF/DOCX/PPTX 提取的图片 |
+| `data/uploads/` | 待处理的暂存文件 |
+| `data/processed/` | 管线处理结果（chunks JSON 文件） |
+| `data/staging/` | 管线暂存区（处理前临时存放） |
 | `data/sessions/` | 会话 JSON 文件 |
-| `data/milvus.db` | Milvus Lite 数据库文件 |
+| `data/milvus.db/` | Milvus Lite 数据库目录 |
+| `data/milvus.db/LOCK` | Milvus 文件锁（fcntl.flock，进程退出自动释放） |
+| `data/milvus.db/collections/` | Collection 向量数据 |
 
 ---
 
@@ -663,3 +726,5 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000
 | **分布式部署** | Milvus Lite → Milvus Standalone/Cluster |
 | **更多文件格式** | 在 `file_parser.py` 中扩展解析器 |
 | **知识图谱** | 在 retriever 中集成图数据库检索 |
+| **管线引擎扩展** | 实现 `PipelineEngine` 接口即可添加新引擎 |
+| **数据库源扩展** | 实现 `DatabaseSource` 接口即可接入新数据源 |
