@@ -18,9 +18,13 @@ const router = createRouter({
       component: () => import('@/views/ChatView.vue'),
     },
     {
-      path: '/docs',
-      name: 'Docs',
+      path: '/files',
+      name: 'Files',
       component: () => import('@/views/DocsView.vue'),
+    },
+    {
+      path: '/admin',
+      redirect: '/files',
     },
   ],
 })

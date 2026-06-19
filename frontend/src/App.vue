@@ -11,7 +11,7 @@
           <el-icon><ChatLineRound /></el-icon>
           <span>对话</span>
         </router-link>
-        <router-link to="/docs" class="nav-link" active-class="active">
+        <router-link to="/files" class="nav-link" active-class="active">
           <el-icon><Document /></el-icon>
           <span>文档管理</span>
         </router-link>

@@ -107,7 +107,28 @@ cleanup_all() {
     if pgrep -f "uvicorn api.main" > /dev/null 2>&1; then
         echo -e "   清理残留 uvicorn 进程..."
         pkill -f "uvicorn api.main" 2>/dev/null || true
-        sleep 1
+    fi
+
+    # 等待所有相关进程真正退出（最多 5 秒）
+    echo -n "   等待进程退出"
+    local waited=0
+    while pgrep -f "uvicorn api.main" > /dev/null 2>&1 && [ $waited -lt 10 ]; do
+        sleep 0.5
+        waited=$((waited + 1))
+        echo -n "."
+    done
+    echo ""
+
+    # 确认 Milvus Lite 锁已释放（LOCK 文件不再被 flock）
+    local lock_file="$SCRIPT_DIR/data/milvus.db/LOCK"
+    if [ -f "$lock_file" ]; then
+        # 尝试获取排他锁来验证锁是否已释放
+        if command -v flock &> /dev/null; then
+            if ! flock -n "$lock_file" true 2>/dev/null; then
+                echo -e "   ${YELLOW}等待 Milvus 锁释放...${NC}"
+                sleep 2
+            fi
+        fi
     fi
 
     echo -e "${GREEN}✅ 所有服务已停止${NC}"
@@ -115,6 +136,13 @@ cleanup_all() {
 
 # 信号处理：确保 Ctrl+C 也能清理（前台模式）
 trap 'echo ""; cleanup_all; exit 0' SIGINT SIGTERM
+
+# ---------- Java 环境 (PySpark) ----------
+export JAVA_HOME=/opt/jdk-17.0.2
+export PATH=$JAVA_HOME/bin:$PATH
+export JAVA_TOOL_OPTIONS="-XX:-UseContainerSupport"  # WSL2 cgroupv2 兼容
+export PYSPARK_PYTHON=/home/yhwz/miniconda3/envs/kbqa/bin/python3
+export PYSPARK_DRIVER_PYTHON=/home/yhwz/miniconda3/envs/kbqa/bin/python3
 
 # ---------- 检查 Python ----------
 find_python() {
@@ -304,7 +332,8 @@ do_stop() {
 do_restart() {
     echo -e "${CYAN}🔄 重启服务...${NC}"
     do_stop
-    sleep 1
+    # 等待 OS 完全释放文件描述符和锁（Milvus Lite 需要）
+    sleep 3
     do_start
 }
 

@@ -52,6 +52,21 @@ class Settings(BaseSettings):
     spark_app_name: str = "KnowledgeQA"
     spark_master: str = "local[*]"
     
+    # ========== 数据库接入配置 ==========
+    db_type: str = ""  # mysql / postgresql / 空表示不启用
+    db_host: str = "localhost"
+    db_port: int = 3306
+    db_user: str = ""
+    db_password: str = ""
+    db_name: str = ""
+    db_table: str = ""  # 要导入的表名
+    db_text_columns: list = []  # 文本列名列表，如 ["title", "content"]
+    db_query: str = ""  # 自定义 SQL 查询（可选）
+    
+    # ========== 管线配置 ==========
+    pipeline_engine: str = "simple"  # simple / spark
+    pipeline_min_text_length: int = 50  # 最短文本长度过滤
+    
     # ========== 服务器配置 ==========
     api_host: str = "0.0.0.0"
     api_port: int = 8000
@@ -63,6 +78,7 @@ class Settings(BaseSettings):
     
     # ========== 文件上传配置 ==========
     upload_dir: str = "./data/raw"
+    staging_dir: str = "./data/staging"  # 批量入库暂存目录
     processed_dir: str = "./data/processed"
     sessions_dir: str = "./data/sessions"
     max_file_size_mb: int = 100

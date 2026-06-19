@@ -19,6 +19,57 @@
         </div>
       </div>
 
+      <!-- 管线统计（可折叠） -->
+      <div class="pipeline-card">
+        <div class="pipeline-header" @click="showPipeline = !showPipeline">
+          <h3>📈 处理管线</h3>
+          <el-icon :class="{ 'rotate-icon': showPipeline }"><ArrowDown /></el-icon>
+        </div>
+        <div v-show="showPipeline" class="pipeline-body">
+          <div class="pipeline-stats">
+            <div class="pipeline-stat">
+              <span class="pstat-value">{{ pipelineStatus.last_run?.files_scanned || 0 }}</span>
+              <span class="pstat-label">处理文件</span>
+            </div>
+            <div class="pipeline-stat">
+              <span class="pstat-value">{{ pipelineStatus.last_run?.total_chunks || 0 }}</span>
+              <span class="pstat-label">生成切片</span>
+            </div>
+            <div class="pipeline-stat">
+              <span class="pstat-value">{{ pipelineStatus.milvus_stats?.row_count || 0 }}</span>
+              <span class="pstat-label">已入库</span>
+            </div>
+            <div class="pipeline-stat">
+              <span class="pstat-value fail">{{ pipelineStatus.last_run?.files_failed || 0 }}</span>
+              <span class="pstat-label">失败</span>
+            </div>
+          </div>
+          <div class="pipeline-info">
+            <div class="pinfo-row">
+              <span class="pinfo-label">引擎</span>
+              <el-tag size="small">{{ pipelineStatus.last_run?.engine || '-' }}</el-tag>
+            </div>
+            <div class="pinfo-row">
+              <span class="pinfo-label">最近运行</span>
+              <span class="pinfo-value">{{ formatTime(pipelineStatus.last_run?.timestamp) }}</span>
+            </div>
+            <div class="pinfo-row" v-if="dbStatus.connected">
+              <span class="pinfo-label">数据库</span>
+              <el-tag type="success" size="small">{{ dbStatus.type?.toUpperCase() }}</el-tag>
+            </div>
+          </div>
+          <!-- 处理历史 -->
+          <div v-if="pipelineHistory.length > 0" class="pipeline-history">
+            <div class="phist-title">处理历史</div>
+            <div v-for="run in pipelineHistory.slice(0, 5)" :key="run.run_id" class="phist-item">
+              <el-tag :type="run.success ? 'success' : 'danger'" size="small">{{ run.engine }}</el-tag>
+              <span class="phist-info">{{ run.total_files }}文件 / {{ run.total_chunks }}切片</span>
+              <span class="phist-time">{{ formatTime(run.timestamp) }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="upload-card">
         <h3>📤 上传文档</h3>
         <el-upload
@@ -34,6 +85,50 @@
           <div class="upload-text">拖拽文件到此处，或 <em>点击选择</em></div>
           <div class="upload-hint">支持批量选择，格式: PDF, DOCX, PPTX, TXT, MD, CSV, XLSX</div>
         </el-upload>
+
+        <!-- 处理模式选择 -->
+        <div class="mode-selector">
+          <div class="mode-label">处理模式</div>
+          <div class="mode-options">
+            <label
+              class="mode-option"
+              :class="{ active: processingMode === 'quick' }"
+              @click="processingMode = 'quick'"
+            >
+              <input type="radio" value="quick" v-model="processingMode" class="mode-radio-input" />
+              <span class="mode-radio-dot"></span>
+              <div class="mode-info">
+                <span class="mode-name">快速入库（推荐）</span>
+                <span class="mode-desc">直接解析入库，几秒完成。适合日常补充文档。</span>
+              </div>
+            </label>
+            <label
+              class="mode-option"
+              :class="{ active: processingMode === 'batch' }"
+              @click="processingMode = 'batch'"
+            >
+              <input type="radio" value="batch" v-model="processingMode" class="mode-radio-input" />
+              <span class="mode-radio-dot"></span>
+              <div class="mode-info">
+                <span class="mode-name">批量入库</span>
+                <span class="mode-desc">批量清洗、去重、统计后自动入库。处理时间较长。</span>
+              </div>
+            </label>
+            <label
+              v-if="dbStatus.connected"
+              class="mode-option"
+              :class="{ active: processingMode === 'database' }"
+              @click="processingMode = 'database'"
+            >
+              <input type="radio" value="database" v-model="processingMode" class="mode-radio-input" />
+              <span class="mode-radio-dot"></span>
+              <div class="mode-info">
+                <span class="mode-name">数据库导入</span>
+                <span class="mode-desc">从 {{ dbStatus.type?.toUpperCase() }} 数据库导入数据。</span>
+              </div>
+            </label>
+          </div>
+        </div>
 
         <!-- 已选文件列表 -->
         <div v-if="fileList.length > 0" class="selected-files">
@@ -81,12 +176,12 @@
         <el-button
           type="primary"
           :loading="uploading"
-          :disabled="fileList.length === 0"
+          :disabled="fileList.length === 0 && processingMode !== 'database'"
           @click="handleUpload"
           style="width: 100%; margin-top: 12px;"
         >
           <el-icon><Upload /></el-icon>
-          {{ uploading ? '上传中...' : `开始上传 (${fileList.length} 个文件)` }}
+          {{ getButtonText() }}
         </el-button>
       </div>
     </div>
@@ -140,10 +235,14 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { UploadFilled, Upload, Refresh, Delete, Document } from '@element-plus/icons-vue'
+import { UploadFilled, Upload, Refresh, Delete, Document, ArrowDown } from '@element-plus/icons-vue'
 import type { UploadFile } from 'element-plus'
-import { getDocStats, listDocuments, uploadDocuments, deleteDocument, clearDocuments } from '@/api'
-import type { DocStats, DocItem, BatchUploadResult } from '@/api'
+import {
+  getDocStats, listDocuments, uploadDocuments, deleteDocument, clearDocuments,
+  processFiles, importFromDatabase, getDatabaseStatus,
+  getPipelineStatus, getPipelineHistory,
+} from '@/api'
+import type { DocStats, DocItem, BatchUploadResult, DatabaseStatus, PipelineStatus } from '@/api'
 
 const stats = ref<DocStats>({ total_docs: 0, collection_name: '' })
 const documents = ref<DocItem[]>([])
@@ -154,6 +253,11 @@ const uploadRef = ref()
 const uploadResult = ref<BatchUploadResult | null>(null)
 const uploadDone = ref(0)
 const uploadTotal = ref(0)
+const processingMode = ref<'quick' | 'batch' | 'database'>('quick')
+const dbStatus = ref<DatabaseStatus>({ connected: false })
+const showPipeline = ref(false)
+const pipelineStatus = ref<PipelineStatus>({ last_run: {}, milvus_stats: {}, database_status: {} })
+const pipelineHistory = ref<Record<string, any>[]>([])
 
 const totalChunks = computed(() =>
   uploadResult.value?.results.reduce((sum, r) => sum + r.chunks, 0) ?? 0
@@ -163,14 +267,43 @@ const totalChunks = computed(() =>
 async function loadData() {
   loading.value = true
   try {
-    const [s, docs] = await Promise.all([getDocStats(), listDocuments()])
+    const [s, docs, db] = await Promise.all([getDocStats(), listDocuments(), getDatabaseStatus()])
     stats.value = s
     documents.value = docs
+    dbStatus.value = db
   } catch (err: any) {
     ElMessage.error('加载失败: ' + (err.message || '未知错误'))
   } finally {
     loading.value = false
   }
+}
+
+// 加载管线数据
+async function loadPipelineData() {
+  try {
+    const [s, h] = await Promise.all([getPipelineStatus(), getPipelineHistory()])
+    pipelineStatus.value = s
+    pipelineHistory.value = (h || []).reverse()
+  } catch { /* 静默 */ }
+}
+
+// 格式化时间
+function formatTime(timestamp: string | undefined): string {
+  if (!timestamp) return '-'
+  try {
+    const date = new Date(timestamp)
+    return `${date.getMonth() + 1}-${date.getDate()} ${date.getHours()}:${String(date.getMinutes()).padStart(2, '0')}`
+  } catch {
+    return timestamp
+  }
+}
+
+// 获取按钮文本
+function getButtonText(): string {
+  if (uploading.value) return '处理中...'
+  if (processingMode.value === 'database') return '从数据库导入'
+  if (processingMode.value === 'batch') return `批量入库 (${fileList.value.length} 个文件)`
+  return `快速入库 (${fileList.value.length} 个文件)`
 }
 
 // 文件选择（每次 onChange 都把最新文件列表同步过来）
@@ -194,6 +327,11 @@ function clearAllFiles() {
 
 // 批量上传
 async function handleUpload() {
+  if (processingMode.value === 'database') {
+    await handleDatabaseImport()
+    return
+  }
+
   if (fileList.value.length === 0) return
 
   uploading.value = true
@@ -202,14 +340,24 @@ async function handleUpload() {
   uploadDone.value = 0
 
   try {
-    const result = await uploadDocuments(fileList.value)
-    uploadResult.value = result
-    uploadDone.value = result.total_files
-
-    if (result.fail_count === 0) {
-      ElMessage.success(`全部 ${result.success_count} 个文件上传成功！`)
+    if (processingMode.value === 'batch') {
+      // 大数据处理模式：调用管线 API
+      const result = await processFiles(fileList.value, 'spark')
+      ElMessage.success(`处理任务已提交（ID: ${result.task_id}）`)
+      // 刷新管线统计
+      await loadPipelineData()
+      showPipeline.value = true
     } else {
-      ElMessage.warning(`${result.success_count} 个成功，${result.fail_count} 个失败`)
+      // 快速入库模式：调用现有批量上传 API
+      const result = await uploadDocuments(fileList.value)
+      uploadResult.value = result
+      uploadDone.value = result.total_files
+
+      if (result.fail_count === 0) {
+        ElMessage.success(`全部 ${result.success_count} 个文件上传成功！`)
+      } else {
+        ElMessage.warning(`${result.success_count} 个成功，${result.fail_count} 个失败`)
+      }
     }
 
     // 清空选择
@@ -218,6 +366,21 @@ async function handleUpload() {
     await loadData()
   } catch (err: any) {
     const detail = err.response?.data?.detail || err.message || '上传失败'
+    ElMessage.error(detail)
+  } finally {
+    uploading.value = false
+  }
+}
+
+// 数据库导入
+async function handleDatabaseImport() {
+  uploading.value = true
+  try {
+    const result = await importFromDatabase()
+    ElMessage.success(result.message)
+    await loadData()
+  } catch (err: any) {
+    const detail = err.response?.data?.detail || err.message || '数据库导入失败'
     ElMessage.error(detail)
   } finally {
     uploading.value = false
@@ -270,7 +433,10 @@ function getFileColor(filename: string): string {
   return colors[ext || ''] || '#909399'
 }
 
-onMounted(loadData)
+onMounted(() => {
+  loadData()
+  loadPipelineData()
+})
 </script>
 
 <style scoped>
@@ -389,6 +555,100 @@ onMounted(loadData)
   font-size: 12px;
   margin-top: 8px;
   opacity: 0.7;
+}
+
+/* ========== 处理模式选择 ========== */
+.mode-selector {
+  margin-top: 16px;
+  padding: 12px;
+  background: var(--bg-dark);
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+}
+
+.mode-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+  font-weight: 500;
+}
+
+.mode-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mode-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-card);
+  cursor: pointer;
+  transition: all 0.2s;
+  user-select: none;
+}
+
+.mode-option:hover {
+  border-color: var(--primary-color);
+}
+
+.mode-option.active {
+  border-color: var(--primary-color);
+  background: rgba(64, 158, 255, 0.05);
+}
+
+.mode-radio-input {
+  display: none;
+}
+
+.mode-radio-dot {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 2px solid var(--border-color);
+  margin-top: 2px;
+  transition: all 0.2s;
+  position: relative;
+}
+
+.mode-option.active .mode-radio-dot {
+  border-color: var(--primary-color);
+}
+
+.mode-option.active .mode-radio-dot::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--primary-color);
+}
+
+.mode-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.mode-name {
+  font-size: 13px;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.mode-desc {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.4;
 }
 
 /* ========== 文档列表 ========== */
@@ -545,5 +805,126 @@ onMounted(loadData)
   font-size: 12px;
   opacity: 0.85;
   margin-left: 16px;
+}
+
+/* ========== 管线统计 ========== */
+.pipeline-card {
+  background: var(--bg-card);
+  border-radius: 12px;
+  border: 1px solid var(--border-color);
+  overflow: hidden;
+}
+
+.pipeline-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.pipeline-header:hover {
+  background: rgba(64, 158, 255, 0.04);
+}
+
+.pipeline-header h3 {
+  font-size: 15px;
+  margin: 0;
+  color: var(--text-primary);
+}
+
+.rotate-icon {
+  transform: rotate(180deg);
+  transition: transform 0.3s;
+}
+
+.pipeline-body {
+  padding: 0 20px 16px;
+}
+
+.pipeline-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.pipeline-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10px 4px;
+  background: var(--bg-dark);
+  border-radius: 8px;
+}
+
+.pstat-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--primary-color);
+}
+
+.pstat-value.fail {
+  color: #f56c6c;
+}
+
+.pstat-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+.pipeline-info {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.pinfo-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+}
+
+.pinfo-label {
+  color: var(--text-secondary);
+}
+
+.pinfo-value {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.pipeline-history {
+  border-top: 1px solid var(--border-color);
+  padding-top: 10px;
+}
+
+.phist-title {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+
+.phist-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.phist-info {
+  flex: 1;
+  color: var(--text-secondary);
+}
+
+.phist-time {
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 </style>

@@ -26,6 +26,10 @@ from api.routes_docs import (
     set_mm_retriever,
 )
 from api.routes_health import router as health_router
+from api.routes_pipeline import (
+    router as pipeline_router,
+    set_pipeline_retriever, set_pipeline_mm_retriever,
+)
 
 logger = get_logger("api")
 
@@ -49,6 +53,7 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(chat_router)
 app.include_router(docs_router)
+app.include_router(pipeline_router)
 
 # 挂载静态文件目录（用于前端访问图片）
 _images_dir = os.path.join(settings.upload_dir, "images")
@@ -80,8 +85,12 @@ async def startup_event():
         set_retriever(text_retriever)
         set_mm_retriever(mm_retriever)
         set_chunker(chunker)
+
+        # 注入到管线服务
+        set_pipeline_retriever(text_retriever)
+        set_pipeline_mm_retriever(mm_retriever)
         
-        logger.info("服务组件初始化完成（纯文本 + 多模态双链路）")
+        logger.info("服务组件初始化完成（纯文本 + 多模态双链路 + 数据管线）")
     except Exception as e:
         logger.error(f"服务组件初始化失败: {e}")
         raise
@@ -111,15 +120,12 @@ if os.path.exists(_frontend_dist):
     # SPA 路由兜底：非 API/静态路径全部返回 index.html
     @app.get("/{full_path:path}")
     async def spa_fallback(request: Request, full_path: str):
-        """SPA 路由兜底"""
-        # 如果是 API 路径或静态文件路径，不处理
-        if full_path.startswith(("api/", "static/", "docs", "health", "assets/")):
-            return FileResponse(os.path.join(_frontend_dist, "index.html"))
-        # 检查是否请求的是前端静态文件
+        """SPA 路由兜底：非 API 路径返回前端 index.html"""
+        # 前端静态文件优先
         file_path = os.path.join(_frontend_dist, full_path)
         if os.path.isfile(file_path):
             return FileResponse(file_path)
-        # 其他路径返回 index.html（SPA 路由）
+        # 所有其他路径返回 index.html（SPA 路由，包括 /files, /chat, /admin 等）
         return FileResponse(os.path.join(_frontend_dist, "index.html"))
 
 

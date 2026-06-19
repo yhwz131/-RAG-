@@ -221,3 +221,112 @@ export async function healthCheck(): Promise<{ status: string; uptime_seconds: n
   const { data } = await api.get('/health')
   return data
 }
+
+// ========== 数据管线 ==========
+
+export interface PipelineEngine {
+  name: string
+  label: string
+  description: string
+}
+
+export interface PipelineTask {
+  task_id: string
+  status: string
+  created_at: string
+  completed_at?: string
+  files_count: number
+  chunks_count: number
+  error?: string
+}
+
+export interface PipelineStatus {
+  last_run: Record<string, any>
+  milvus_stats: Record<string, any>
+  database_status: Record<string, any>
+}
+
+export interface DatabaseStatus {
+  connected: boolean
+  type?: string
+  host?: string
+  database?: string
+  table?: string
+  error?: string
+}
+
+export interface DatabaseTableInfo {
+  database: string
+  tables: Array<{
+    name: string
+    row_count: number
+    columns: Array<{ name: string; type: string }>
+  }>
+}
+
+export async function getPipelineEngines(): Promise<PipelineEngine[]> {
+  const { data } = await api.get('/pipeline/engines')
+  return data.engines || []
+}
+
+export async function processFiles(
+  files: File[],
+  engine: string = 'simple'
+): Promise<{ task_id: string; status: string; message: string }> {
+  const formData = new FormData()
+  for (const file of files) {
+    formData.append('files', file)
+  }
+  const { data } = await api.post(`/pipeline/process?engine=${engine}`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 600000,
+  })
+  return data
+}
+
+export async function getTaskStatus(taskId: string): Promise<PipelineTask> {
+  const { data } = await api.get(`/pipeline/tasks/${taskId}`)
+  return data
+}
+
+export async function getAllTasks(): Promise<PipelineTask[]> {
+  const { data } = await api.get('/pipeline/tasks')
+  return data.tasks || []
+}
+
+export async function getPipelineStatus(): Promise<PipelineStatus> {
+  const { data } = await api.get('/pipeline/status')
+  return data
+}
+
+export async function getPipelineHistory(): Promise<Record<string, any>[]> {
+  const { data } = await api.get('/pipeline/history')
+  return data.runs || []
+}
+
+export async function getQualityReport(): Promise<Record<string, any>> {
+  const { data } = await api.get('/pipeline/quality')
+  return data
+}
+
+export async function getDatabaseStatus(): Promise<DatabaseStatus> {
+  const { data } = await api.get('/pipeline/database/status')
+  return data
+}
+
+export async function getDatabaseTables(): Promise<DatabaseTableInfo> {
+  const { data } = await api.get('/pipeline/database/tables')
+  return data
+}
+
+export async function testDatabaseConnection(): Promise<{ status: string; type: string }> {
+  const { data } = await api.post('/pipeline/database/test')
+  return data
+}
+
+export async function importFromDatabase(
+  query?: string
+): Promise<{ status: string; total_rows: number; total_chunks: number; message: string }> {
+  const { data } = await api.post('/pipeline/database/import', { query })
+  return data
+}
