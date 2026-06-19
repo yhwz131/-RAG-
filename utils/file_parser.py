@@ -12,6 +12,8 @@ logger = get_logger("file_parser")
 class FileParser:
     """文件解析器，将不同格式文档统一转为纯文本"""
     
+    SUPPORTED_FORMATS = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".txt", ".md", ".csv"}
+    
     @staticmethod
     def parse(file_path: str) -> str:
         """

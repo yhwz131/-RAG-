@@ -129,9 +129,37 @@
       </div>
 
       <!-- 底部输入区 -->
-      <div class="input-area">
+      <div
+        class="input-area"
+        @dragover.prevent="isDragging = true"
+        @dragleave.prevent="isDragging = false"
+        @drop.prevent="handleDrop"
+      >
+        <!-- 拖拽提示覆盖层 -->
+        <Transition name="fade">
+          <div v-if="isDragging" class="drop-overlay">
+            <el-icon :size="40"><UploadFilled /></el-icon>
+            <span>松开鼠标上传文件</span>
+          </div>
+        </Transition>
+        <!-- 文件预览区 -->
+        <div v-if="store.pendingFiles.length > 0" class="file-preview-area">
+          <div v-for="f in store.pendingFiles" :key="f.id" class="file-preview-item" :class="{ 'is-image': f.isImage }">
+            <img v-if="f.isImage && f.preview" :src="f.preview" class="preview-thumb" />
+            <div v-else class="preview-doc">
+              <el-icon :size="28"><Document /></el-icon>
+              <span class="doc-name">{{ f.fileName }}</span>
+            </div>
+            <el-icon class="preview-remove" @click="store.removePendingFile(f.id)"><CloseBold /></el-icon>
+          </div>
+        </div>
         <div class="input-toolbar">
-          <el-segmented v-model="store.mode" :options="modeOptions" size="small" />
+          <div class="toolbar-left">
+            <el-segmented v-model="store.mode" :options="modeOptions" size="small" />
+            <el-button text size="small" @click="triggerFileUpload" :disabled="store.loading" title="上传文件">
+              <el-icon><UploadFilled /></el-icon>
+            </el-button>
+          </div>
           <el-button
             text
             size="small"
@@ -159,11 +187,20 @@
             circle
             size="large"
             :loading="store.loading"
-            :disabled="!inputText.trim() || store.loading"
+            :disabled="(!inputText.trim() && store.pendingFiles.length === 0) || store.loading"
             @click="sendMessage"
             class="send-btn"
           />
         </div>
+        <!-- 隐藏的文件输入 -->
+        <input
+          ref="fileInputRef"
+          type="file"
+          accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.md,.csv"
+          multiple
+          style="display: none"
+          @change="handleFileSelect"
+        />
       </div>
     </div>
   </div>
@@ -173,7 +210,7 @@
 import { ref, onMounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Delete, Promotion, Connection, User, Collection, ChatLineSquare, DArrowLeft, DArrowRight } from '@element-plus/icons-vue'
+import { Plus, Delete, Promotion, Connection, User, Collection, ChatLineSquare, DArrowLeft, DArrowRight, Picture, CloseBold, Document, UploadFilled } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import { useChatStore } from '@/stores/chat'
 import { chatStream } from '@/api'
@@ -185,6 +222,8 @@ const router = useRouter()
 const inputText = ref('')
 const messagesRef = ref<HTMLElement>()
 const streamingContent = ref('')
+const fileInputRef = ref<HTMLInputElement>()
+const isDragging = ref(false)
 
 const modeOptions = [
   { label: '📄 纯文本', value: 'text' },
@@ -212,6 +251,28 @@ function scrollToBottom() {
   })
 }
 
+// 打开文件选择
+function triggerFileUpload() {
+  fileInputRef.value?.click()
+}
+
+// 处理文件选择
+function handleFileSelect(e: Event) {
+  const input = e.target as HTMLInputElement
+  if (input.files) {
+    store.addPendingFiles(Array.from(input.files))
+    input.value = '' // 重置，允许重复选同一文件
+  }
+}
+
+// 处理拖拽上传
+function handleDrop(e: DragEvent) {
+  isDragging.value = false
+  if (e.dataTransfer?.files?.length) {
+    store.addPendingFiles(Array.from(e.dataTransfer.files))
+  }
+}
+
 // 发送消息
 async function sendMessage() {
   const text = inputText.value.trim()
@@ -222,8 +283,24 @@ async function sendMessage() {
     store.newSession()
   }
 
-  // 添加用户消息
-  store.messages.push({ role: 'user', content: text })
+  // 分离图片和文档
+  const imageFiles = store.pendingFiles.filter(f => f.isImage)
+  const docFiles = store.pendingFiles.filter(f => !f.isImage)
+  const imageBase64s = imageFiles.map(p => p.base64)
+  const fileMetas = docFiles.map(f => ({
+    name: f.fileName,
+    content: f.base64,
+  }))
+
+  // 添加用户消息（附带文件数量标记）
+  let displayText = text
+  const parts: string[] = []
+  if (imageBase64s.length > 0) parts.push(`${imageBase64s.length}张图片`)
+  if (docFiles.length > 0) parts.push(`${docFiles.length}个文件`)
+  if (parts.length > 0) {
+    displayText = `${text} [${parts.join('，')}]`
+  }
+  store.messages.push({ role: 'user', content: displayText })
   inputText.value = ''
   store.loading = true
   store.currentReferences = []
@@ -251,6 +328,7 @@ async function sendMessage() {
     async () => {
       store.loading = false
       streamingContent.value = ''
+      store.clearPendingFiles()
       await store.loadSessions()
       // 更新 URL
       router.replace(`/chat/${store.sessionId}`)
@@ -259,8 +337,13 @@ async function sendMessage() {
     (err) => {
       store.loading = false
       streamingContent.value = ''
+      store.clearPendingFiles()
       store.messages[store.messages.length - 1].content = `❌ ${err}`
-    }
+    },
+    // images
+    imageBase64s,
+    // files
+    fileMetas
   )
 }
 
@@ -681,12 +764,118 @@ watch(() => route.params.sessionId, async (sid) => {
 
 /* ========== 输入区 ========== */
 .input-area {
+  position: relative;
   padding: 12px 20px 16px;
   border-top: 1px solid var(--border-color);
   background: var(--bg-darker);
   max-width: 900px;
   margin: 0 auto;
   width: 100%;
+}
+
+/* ========== 文件预览 ========== */
+.file-preview-area {
+  display: flex;
+  gap: 8px;
+  padding: 8px 0;
+  flex-wrap: wrap;
+}
+
+.file-preview-item {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+}
+
+.file-preview-item.is-image {
+  border-color: var(--el-color-primary-light-5);
+}
+
+.preview-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.preview-doc {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: var(--el-fill-color-light);
+  color: var(--el-text-color-regular);
+  gap: 2px;
+  padding: 4px;
+}
+
+.doc-name {
+  font-size: 9px;
+  text-align: center;
+  line-height: 1.1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+  max-width: 58px;
+}
+
+.preview-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 50%;
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  transition: background 0.2s;
+}
+
+.preview-remove:hover {
+  background: #f56c6c;
+}
+
+/* ========== 拖拽上传覆盖层 ========== */
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  background: rgba(var(--el-color-primary-rgb), 0.08);
+  border: 2px dashed var(--el-color-primary);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--el-color-primary);
+  font-size: 15px;
+  pointer-events: none;
+}
+
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.15s;
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+.toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .input-toolbar {

@@ -9,9 +9,8 @@ import uuid
 import asyncio
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-from pathlib import Path
 
-from .schema import PipelineResult, TaskStatus, QualityReport, ChunkData
+from .schema import PipelineResult, TaskStatus
 from .adapter import PipelineEngine, DatabaseSource
 from .engines.simple import SimpleEngine
 from .engines.spark_engine import SparkEngine
@@ -113,94 +112,85 @@ class PipelineService:
         except Exception as e:
             return {"connected": False, "type": self._db_source.source_type, "error": str(e)}
 
+    def save_db_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        保存数据库配置到 .env 文件并重建数据源
+        """
+        import re
+
+        env_path = ".env"
+        env_lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                env_lines = f.readlines()
+
+        # 需要写入的配置项
+        db_keys = [
+            "db_type", "db_host", "db_port", "db_user",
+            "db_password", "db_name", "db_table", "db_text_columns",
+        ]
+
+        # 构建新配置行
+        new_lines = []
+        for key in db_keys:
+            value = config.get(key, "")
+            # db_text_columns 可能是 list（前端传来的），需要转为逗号分隔字符串
+            if key == "db_text_columns" and isinstance(value, list):
+                value = ",".join(value)
+            new_lines.append(f"{key.upper()}={value}\n")
+
+        # 替换或追加
+        updated_keys = set()
+        for i, line in enumerate(env_lines):
+            for key in db_keys:
+                if line.strip().startswith(f"{key.upper()}="):
+                    env_lines[i] = f"{key.upper()}={config.get(key, '')}\n"
+                    if key == "db_text_columns":
+                        cols = config.get(key, "")
+                        if isinstance(cols, list):
+                            cols = ",".join(cols)
+                        env_lines[i] = f"DB_TEXT_COLUMNS={cols}\n"
+                    updated_keys.add(key)
+                    break
+
+        # 追加未找到的 key
+        for key in db_keys:
+            if key not in updated_keys:
+                value = config.get(key, "")
+                env_lines.append(f"{key.upper()}={value}\n")
+
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(env_lines)
+
+        # 更新运行时 settings
+        settings.db_type = config.get("db_type", "mysql")
+        settings.db_host = config.get("db_host", "localhost")
+        settings.db_port = config.get("db_port", 3306)
+        settings.db_user = config.get("db_user", "")
+        settings.db_password = config.get("db_password", "")
+        settings.db_name = config.get("db_name", "")
+        settings.db_table = config.get("db_table", "")
+        # db_text_columns 存储为逗号分隔字符串
+        cols = config.get("db_text_columns", "")
+        if isinstance(cols, list):
+            settings.db_text_columns = ",".join(cols)
+        else:
+            settings.db_text_columns = str(cols)
+
+        # 重建数据源
+        self._db_source = create_database_source(config.get("db_type", "mysql"))
+        logger.info(f"数据库配置已保存并重建数据源: type={config.get('db_type')}")
+
+        return {"status": "ok", "message": "数据库配置已保存"}
+
     def fetch_from_database(self, query: Optional[str] = None) -> PipelineResult:
-        """从数据库获取数据并处理入库"""
-        if not self._db_source:
-            return PipelineResult(
-                run_id="",
-                engine="database",
-                success=False,
-                error="未配置数据库数据源",
-            )
-
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        logger.info(f"[数据库导入] 开始: type={self._db_source.source_type}, run_id={run_id}")
-
-        try:
-            # 1. 从数据库获取数据
-            rows = self._db_source.fetch_data(query)
-            if not rows:
-                return PipelineResult(
-                    run_id=run_id,
-                    engine="database",
-                    success=True,
-                    total_files=0,
-                    total_chunks=0,
-                )
-
-            # 2. 将数据库记录转为文本切片
-            chunks_data = []
-            for i, row in enumerate(rows):
-                # 合并所有文本列
-                text_parts = []
-                for key, value in row.items():
-                    if value and isinstance(value, str) and value.strip():
-                        text_parts.append(f"{key}: {value}")
-                text = "\n".join(text_parts)
-
-                if len(text.strip()) < settings.pipeline_min_text_length:
-                    continue
-
-                chunk = ChunkData(
-                    chunk_id=f"db_{run_id}_{i}",
-                    content=text,
-                    source=f"database:{self._db_source.source_type}",
-                    page_number=0,
-                    metadata={"row_index": i, "columns": list(row.keys())},
-                )
-                chunks_data.append(chunk)
-
-            # 3. 输出到 processed 目录
-            output_dir = settings.processed_dir
-            os.makedirs(output_dir, exist_ok=True)
-            chunks_file = os.path.join(output_dir, "all_chunks.json")
-            with open(chunks_file, "w", encoding="utf-8") as f:
-                json.dump([c.model_dump() for c in chunks_data], f, ensure_ascii=False, indent=2)
-
-            # 4. 自动入库
-            imported = 0
-            if self._retriever:
-                milvus_data = []
-                for c in chunks_data:
-                    d = c.model_dump()
-                    # 字段映射：pipeline 用 "source"，Milvus 用 "filename"
-                    if "filename" not in d and "source" in d:
-                        d["filename"] = self._strip_uuid_prefix(d["source"])
-                    milvus_data.append(d)
-                imported = self._retriever.insert_documents(milvus_data)
-                logger.info(f"数据库导入 Milvus: {imported} 条")
-
-            logger.info(f"[数据库导入] 完成: {len(chunks_data)} 条记录, {imported} 条入库")
-
-            return PipelineResult(
-                run_id=run_id,
-                engine="database",
-                input_dir=f"database:{self._db_source.source_type}",
-                output_dir=output_dir,
-                chunks_file=chunks_file,
-                total_files=len(rows),
-                total_chunks=len(chunks_data),
-                success=True,
-            )
-
-        except Exception as e:
-            logger.error(f"数据库导入失败: {e}")
-            return PipelineResult(
-                run_id=run_id,
-                engine="database",
-                success=False,
-                error=str(e),
-            )
+        """数据库数据不再向量化入库，改用 Text-to-SQL 直接查询"""
+        return PipelineResult(
+            run_id="",
+            engine="database",
+            success=False,
+            error="数据库数据已改用 Text-to-SQL 模式，请通过聊天界面直接提问查询数据库",
+        )
 
     # ========== 处理流程 ==========
 

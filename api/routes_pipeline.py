@@ -50,6 +50,18 @@ class DatabaseQueryRequest(BaseModel):
     limit: int = 10000
 
 
+class DatabaseConfigRequest(BaseModel):
+    """数据库配置请求"""
+    db_type: str = "mysql"
+    db_host: str
+    db_port: int = 3306
+    db_user: str
+    db_password: str
+    db_name: str
+    db_table: str = ""
+    db_text_columns: List[str] = []
+
+
 class ProcessResponse(BaseModel):
     """处理响应"""
     task_id: Optional[str] = None
@@ -245,44 +257,73 @@ async def get_database_tables():
 
 @router.post("/database/import")
 async def import_from_database(request: DatabaseQueryRequest):
-    """
-    从数据库导入数据到知识库
-    """
-    db_source = pipeline_service.get_db_source()
-    if not db_source:
-        raise HTTPException(status_code=400, detail="未配置数据库数据源")
-
-    try:
-        result = pipeline_service.fetch_from_database(query=request.query)
-        if result.success:
-            return {
-                "status": "completed",
-                "total_rows": result.total_files,
-                "total_chunks": result.total_chunks,
-                "message": f"成功从数据库导入 {result.total_chunks} 条记录",
-            }
-        else:
-            raise HTTPException(status_code=500, detail=result.error)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"数据库导入失败: {e}")
+    """数据库数据已改用 Text-to-SQL 模式，不再支持向量化导入"""
+    return {
+        "status": "deprecated",
+        "message": "数据库数据已改用 Text-to-SQL 模式，请通过聊天界面直接提问查询数据库",
+    }
 
 
 @router.post("/database/test")
-async def test_database_connection():
-    """测试数据库连接"""
-    db_source = pipeline_service.get_db_source()
-    if not db_source:
-        raise HTTPException(status_code=400, detail="未配置数据库数据源")
-
+async def test_database_connection(config: Optional[DatabaseConfigRequest] = None):
+    """测试数据库连接（可传入临时配置测试）"""
     try:
-        connected = db_source.connect()
+        if config:
+            # 用传入的配置临时测试
+            from api.pipeline.engines.database import MySQLSource, PostgreSQLSource
+            if config.db_type == "mysql":
+                source = MySQLSource(
+                    host=config.db_host, port=config.db_port,
+                    user=config.db_user, password=config.db_password,
+                    database=config.db_name, table=config.db_table,
+                    text_columns=config.db_text_columns or None,
+                )
+            else:
+                source = PostgreSQLSource(
+                    host=config.db_host, port=config.db_port,
+                    user=config.db_user, password=config.db_password,
+                    database=config.db_name, table=config.db_table,
+                    text_columns=config.db_text_columns or None,
+                )
+            connected = source.connect()
+            source.close()
+        else:
+            db_source = pipeline_service.get_db_source()
+            if not db_source:
+                raise HTTPException(status_code=400, detail="未配置数据库数据源")
+            connected = db_source.connect()
+
         if connected:
-            return {"status": "connected", "type": db_source.source_type}
+            return {"status": "connected", "type": config.db_type if config else "mysql"}
         else:
             raise HTTPException(status_code=500, detail="连接失败")
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"连接测试失败: {e}")
+
+
+@router.post("/database/config")
+async def save_database_config(config: DatabaseConfigRequest):
+    """保存数据库配置到 .env 文件并重建数据源"""
+    try:
+        result = pipeline_service.save_db_config(config.model_dump())
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"保存配置失败: {e}")
+
+
+@router.get("/database/config")
+async def get_database_config():
+    """获取当前数据库配置（密码脱敏）"""
+    from config.settings import settings
+    return {
+        "db_type": settings.db_type or "mysql",
+        "db_host": settings.db_host,
+        "db_port": settings.db_port,
+        "db_user": settings.db_user,
+        "db_password": "***" if settings.db_password else "",
+        "db_name": settings.db_name,
+        "db_table": settings.db_table,
+        "db_text_columns": settings.db_text_columns_list,
+    }

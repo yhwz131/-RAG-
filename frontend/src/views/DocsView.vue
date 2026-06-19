@@ -70,6 +70,62 @@
         </div>
       </div>
 
+      <!-- 数据库接入（MySQL） -->
+      <div class="db-card">
+        <div class="pipeline-header" @click="showDbConfig = !showDbConfig">
+          <h3>🗄️ 数据库配置（Text-to-SQL）</h3>
+          <div class="db-header-right">
+            <el-tag v-if="dbStatus.connected" type="success" size="small">已连接</el-tag>
+            <el-tag v-else type="info" size="small">未配置</el-tag>
+            <el-icon :class="{ 'rotate-icon': showDbConfig }"><ArrowDown /></el-icon>
+          </div>
+        </div>
+        <div v-show="showDbConfig" class="db-config-body">
+          <div class="db-tip">
+            配置数据库连接后，可在聊天界面直接用自然语言提问，系统会自动生成 SQL 查询数据库。
+          </div>
+          <div class="db-form">
+            <div class="db-form-row">
+              <label>主机</label>
+              <el-input v-model="dbConfig.db_host" placeholder="localhost" size="small" />
+            </div>
+            <div class="db-form-row">
+              <label>端口</label>
+              <el-input-number v-model="dbConfig.db_port" :min="1" :max="65535" size="small" controls-position="right" />
+            </div>
+            <div class="db-form-row">
+              <label>用户名</label>
+              <el-input v-model="dbConfig.db_user" placeholder="root" size="small" />
+            </div>
+            <div class="db-form-row">
+              <label>密码</label>
+              <el-input v-model="dbConfig.db_password" type="password" show-password placeholder="数据库密码" size="small" />
+            </div>
+            <div class="db-form-row">
+              <label>数据库</label>
+              <el-input v-model="dbConfig.db_name" placeholder="database_name" size="small" />
+            </div>
+            <div class="db-form-row">
+              <label>表名</label>
+              <el-input v-model="dbConfig.db_table" placeholder="table_name" size="small" />
+            </div>
+
+          </div>
+          <div v-if="dbTestResult" class="db-test-result" :class="dbTestResult.ok ? 'ok' : 'fail'">
+            {{ dbTestResult.ok ? '✅' : '❌' }} {{ dbTestResult.msg }}
+          </div>
+          <div class="db-actions">
+            <el-button size="small" :loading="dbConfigLoading" @click="handleTestDb">
+              测试连接
+            </el-button>
+            <el-button size="small" type="primary" :loading="dbConfigLoading" @click="handleSaveDb">
+              保存配置
+            </el-button>
+
+          </div>
+        </div>
+      </div>
+
       <div class="upload-card">
         <h3>📤 上传文档</h3>
         <el-upload
@@ -114,19 +170,7 @@
                 <span class="mode-desc">批量清洗、去重、统计后自动入库。处理时间较长。</span>
               </div>
             </label>
-            <label
-              v-if="dbStatus.connected"
-              class="mode-option"
-              :class="{ active: processingMode === 'database' }"
-              @click="processingMode = 'database'"
-            >
-              <input type="radio" value="database" v-model="processingMode" class="mode-radio-input" />
-              <span class="mode-radio-dot"></span>
-              <div class="mode-info">
-                <span class="mode-name">数据库导入</span>
-                <span class="mode-desc">从 {{ dbStatus.type?.toUpperCase() }} 数据库导入数据。</span>
-              </div>
-            </label>
+
           </div>
         </div>
 
@@ -176,7 +220,7 @@
         <el-button
           type="primary"
           :loading="uploading"
-          :disabled="fileList.length === 0 && processingMode !== 'database'"
+          :disabled="fileList.length === 0"
           @click="handleUpload"
           style="width: 100%; margin-top: 12px;"
         >
@@ -239,10 +283,11 @@ import { UploadFilled, Upload, Refresh, Delete, Document, ArrowDown } from '@ele
 import type { UploadFile } from 'element-plus'
 import {
   getDocStats, listDocuments, uploadDocuments, deleteDocument, clearDocuments,
-  processFiles, importFromDatabase, getDatabaseStatus,
+  processFiles, getDatabaseStatus,
   getPipelineStatus, getPipelineHistory,
+  getDatabaseConfig, saveDatabaseConfig, testDatabaseConfig,
 } from '@/api'
-import type { DocStats, DocItem, BatchUploadResult, DatabaseStatus, PipelineStatus } from '@/api'
+import type { DocStats, DocItem, BatchUploadResult, DatabaseStatus, PipelineStatus, DatabaseConfig } from '@/api'
 
 const stats = ref<DocStats>({ total_docs: 0, collection_name: '' })
 const documents = ref<DocItem[]>([])
@@ -253,11 +298,18 @@ const uploadRef = ref()
 const uploadResult = ref<BatchUploadResult | null>(null)
 const uploadDone = ref(0)
 const uploadTotal = ref(0)
-const processingMode = ref<'quick' | 'batch' | 'database'>('quick')
+const processingMode = ref<'quick' | 'batch'>('quick')
 const dbStatus = ref<DatabaseStatus>({ connected: false })
 const showPipeline = ref(false)
 const pipelineStatus = ref<PipelineStatus>({ last_run: {}, milvus_stats: {}, database_status: {} })
 const pipelineHistory = ref<Record<string, any>[]>([])
+const showDbConfig = ref(false)
+const dbConfig = ref<DatabaseConfig>({
+  db_type: 'mysql', db_host: 'localhost', db_port: 3306,
+  db_user: '', db_password: '', db_name: '', db_table: '',
+})
+const dbConfigLoading = ref(false)
+const dbTestResult = ref<{ ok: boolean; msg: string } | null>(null)
 
 const totalChunks = computed(() =>
   uploadResult.value?.results.reduce((sum, r) => sum + r.chunks, 0) ?? 0
@@ -301,7 +353,7 @@ function formatTime(timestamp: string | undefined): string {
 // 获取按钮文本
 function getButtonText(): string {
   if (uploading.value) return '处理中...'
-  if (processingMode.value === 'database') return '从数据库导入'
+
   if (processingMode.value === 'batch') return `批量入库 (${fileList.value.length} 个文件)`
   return `快速入库 (${fileList.value.length} 个文件)`
 }
@@ -327,10 +379,7 @@ function clearAllFiles() {
 
 // 批量上传
 async function handleUpload() {
-  if (processingMode.value === 'database') {
-    await handleDatabaseImport()
-    return
-  }
+
 
   if (fileList.value.length === 0) return
 
@@ -372,18 +421,47 @@ async function handleUpload() {
   }
 }
 
-// 数据库导入
-async function handleDatabaseImport() {
-  uploading.value = true
+
+
+// 打开数据库配置
+async function openDbConfig() {
+  showDbConfig.value = true
+  dbTestResult.value = null
   try {
-    const result = await importFromDatabase()
-    ElMessage.success(result.message)
-    await loadData()
+    const cfg = await getDatabaseConfig()
+    dbConfig.value = {
+      ...cfg,
+      db_password: '',
+    }
+  } catch { /* 使用默认值 */ }
+}
+
+// 测试数据库连接
+async function handleTestDb() {
+  dbConfigLoading.value = true
+  dbTestResult.value = null
+  try {
+    const res = await testDatabaseConfig(dbConfig.value)
+    dbTestResult.value = { ok: true, msg: `连接成功 (${res.type})` }
   } catch (err: any) {
-    const detail = err.response?.data?.detail || err.message || '数据库导入失败'
-    ElMessage.error(detail)
+    dbTestResult.value = { ok: false, msg: err.response?.data?.detail || '连接失败' }
   } finally {
-    uploading.value = false
+    dbConfigLoading.value = false
+  }
+}
+
+// 保存数据库配置
+async function handleSaveDb() {
+  dbConfigLoading.value = true
+  try {
+    await saveDatabaseConfig(dbConfig.value)
+    ElMessage.success('数据库配置已保存')
+    showDbConfig.value = false
+    await loadData()  // 刷新状态
+  } catch (err: any) {
+    ElMessage.error(err.response?.data?.detail || '保存失败')
+  } finally {
+    dbConfigLoading.value = false
   }
 }
 
@@ -503,6 +581,83 @@ onMounted(() => {
 
 .stat-collection {
   margin-top: 12px;
+}
+
+/* ========== 数据库配置卡片 ========== */
+.db-card {
+  background: var(--bg-card);
+  border-radius: 12px;
+  border: 1px solid var(--border-color);
+  overflow: hidden;
+}
+
+.db-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.db-config-body {
+  padding: 0 20px 16px;
+}
+
+.db-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.db-form-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.db-form-row label {
+  width: 56px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  text-align: right;
+}
+
+.db-form-row .el-input,
+.db-form-row .el-input-number {
+  flex: 1;
+}
+
+.db-test-result {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.db-test-result.ok {
+  background: rgba(103, 194, 58, 0.1);
+  color: #67c23a;
+}
+
+.db-test-result.fail {
+  background: rgba(245, 108, 108, 0.1);
+  color: #f56c6c;
+}
+
+.db-tip {
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: rgba(64, 158, 255, 0.08);
+  border-radius: 6px;
+  font-size: 13px;
+  color: #409eff;
+  line-height: 1.5;
+}
+
+.db-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+  justify-content: flex-end;
 }
 
 /* ========== 上传卡片 ========== */

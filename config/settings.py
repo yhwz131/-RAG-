@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 2048
     llm_timeout: float = 120.0
     
+    # ========== 多模态 LLM 配置（mimo-v2-omni） ==========
+    mm_llm_model_name: str = "mimo-v2-omni"
+    
     # ========== Embedding 配置 ==========
     embedding_api_key: str = ""
     embedding_base_url: str = "https://api.siliconflow.cn/v1"
@@ -60,8 +63,15 @@ class Settings(BaseSettings):
     db_password: str = ""
     db_name: str = ""
     db_table: str = ""  # 要导入的表名
-    db_text_columns: list = []  # 文本列名列表，如 ["title", "content"]
+    db_text_columns: str = ""  # 文本列名，逗号分隔，如 "title,content"
     db_query: str = ""  # 自定义 SQL 查询（可选）
+
+    @property
+    def db_text_columns_list(self) -> list:
+        """将逗号分隔的文本列名解析为列表"""
+        if not self.db_text_columns:
+            return []
+        return [c.strip() for c in self.db_text_columns.split(",") if c.strip()]
     
     # ========== 管线配置 ==========
     pipeline_engine: str = "simple"  # simple / spark
@@ -133,6 +143,16 @@ class Settings(BaseSettings):
     def llm_model(self) -> str:
         """LLM 模型名（兼容属性）"""
         return self.llm_model_name
+    
+    @property
+    def mm_llm_api_url(self) -> str:
+        """多模态 LLM API 完整地址（与 LLM 共用端点）"""
+        return f"{self.llm_base_url.rstrip('/')}/chat/completions"
+    
+    @property
+    def mm_llm_model(self) -> str:
+        """多模态 LLM 模型名"""
+        return self.mm_llm_model_name
     
     @property
     def embedding_dimension(self) -> int:

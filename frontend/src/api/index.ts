@@ -54,7 +54,9 @@ export async function chatStream(
   onSources: (refs: Reference[]) => void,
   onToken: (token: string) => void,
   onDone: () => void,
-  onError: (err: string) => void
+  onError: (err: string) => void,
+  images: string[] = [],
+  files: { name: string; content: string }[] = []
 ): Promise<void> {
   try {
     const resp = await fetch('/api/chat', {
@@ -65,6 +67,8 @@ export async function chatStream(
         session_id: sessionId,
         stream: true,
         mode,
+        images,
+        files,
       }),
     })
 
@@ -321,6 +325,32 @@ export async function getDatabaseTables(): Promise<DatabaseTableInfo> {
 
 export async function testDatabaseConnection(): Promise<{ status: string; type: string }> {
   const { data } = await api.post('/pipeline/database/test')
+  return data
+}
+
+export interface DatabaseConfig {
+  db_type: string
+  db_host: string
+  db_port: number
+  db_user: string
+  db_password: string
+  db_name: string
+  db_table: string
+  db_text_columns?: string[]
+}
+
+export async function getDatabaseConfig(): Promise<DatabaseConfig> {
+  const { data } = await api.get('/pipeline/database/config')
+  return data
+}
+
+export async function saveDatabaseConfig(config: DatabaseConfig): Promise<{ status: string; message: string }> {
+  const { data } = await api.post('/pipeline/database/config', config)
+  return data
+}
+
+export async function testDatabaseConfig(config: DatabaseConfig): Promise<{ status: string; type: string }> {
+  const { data } = await api.post('/pipeline/database/test', config)
   return data
 }
 

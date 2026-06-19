@@ -574,14 +574,14 @@ class MultimodalRetriever:
                 }
             ]
             payload = {
-                "model": settings.llm_model_name,
+                "model": settings.mm_llm_model,
                 "messages": messages,
                 "max_tokens": 100,
                 "temperature": 0,
             }
             with httpx.Client(timeout=30) as client:
                 resp = client.post(
-                    settings.llm_api_url, json=payload, headers=headers
+                    settings.mm_llm_api_url, json=payload, headers=headers
                 )
                 resp.raise_for_status()
                 desc = resp.json()["choices"][0]["message"]["content"].strip()

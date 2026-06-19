@@ -6,6 +6,7 @@
 - rag: 需要从知识库检索信息才能准确回答的问题
 - chitchat: 闲聊、问候、情感表达、与知识库无关的对话
 - general: 通用知识问题，不需要特定知识库，用通用知识就能回答
+- database: 数据库结构化查询，需要 SQL 查询才能回答（Text-to-SQL）
 
 路由策略：
 1. 第一层：规则匹配（零成本，极速） - 命中则直接返回
@@ -27,6 +28,7 @@ class QueryType(str, Enum):
     RAG = "rag"           # 需要知识库检索
     CHITCHAT = "chitchat" # 闲聊/问候
     GENERAL = "general"   # 通用知识（不需要知识库）
+    DATABASE = "database" # 数据库结构化查询（Text-to-SQL）
 
 
 # ========== 第一层：规则匹配（零成本，极速） ==========
@@ -43,6 +45,12 @@ SMALL_TALK_PATTERNS = [
     r'^(今天天气|现在几点|几点了|吃了吗|在吗|在不在)(怎么样|如何|好不好|吗|了)?[\s?？]*$',
     r'^(无聊|开心|难过|哈哈|呵呵|嗯嗯|哦哦|好的|ok|okay)[\s!！。.？?]*$',
     r'^(你能理解我吗|你有感情吗|你有意识吗|你喜欢什么)[\s?？]*$',
+    r'^(测试|test|123|ping)[\s!！。.？?]*$',
+    # 情感/状态表达
+    r'^(今天)?(心情|感觉|状态)(今天)?(不错|很好|挺好|糟糕|不好|一般|还行|美滋滋|开心|郁闷)',
+    r'^(今天)?(挺|真|太|好)(开心|高兴|无聊|烦|累|困|饿|热|冷|爽)',
+    r'^(最近|今天|这几天)(过得|日子|生活)(怎么样|如何|还行|不错)',
+    r'^(晚安|早安|午安|周末愉快|节日快乐|新年好)',
 ]
 
 
@@ -70,18 +78,100 @@ def rule_based_route(query: str) -> Optional[QueryType]:
     return None  # 未命中，进入下一层
 
 
+# 通用常识模式 — 未提及项目/文档/知识库时默认 general
+GENERAL_PATTERNS = [
+    r'^(如何|怎么|怎样)(学习|学|入门|精通|提高|练习)',
+    r'^(什么是|什么叫|何为|何谓)\s*\w+[\s?？]*$',
+    r'^(怎么做|如何做|怎样做)\s*\w+[\s?？]*$',
+]
+# 项目/知识库关键词 — 出现这些词时倾向 rag
+KB_KEYWORDS = ['知识库', '文档', '项目', '系统', '架构', '数据库', '论文', '毕设', '毕业设计', '课程']
+
+# 数据库查询关键词 — 出现这些词时倾向 database（Text-to-SQL）
+DB_QUERY_KEYWORDS = [
+    '查询', '统计', '排名', '排行', '列表', '多少', '几个', '哪些',
+    '最多', '最少', '最高', '最低', '平均', '总计', '总数', '数量',
+    'top', '前', '后', '大于', '小于', '等于', '超过', '低于',
+    '播放量', '弹幕', '时长', '发布', '视频',
+]
+
+
+def _check_database_query(query: str) -> Optional[QueryType]:
+    """检查是否为数据库查询类问题（Text-to-SQL）
+    
+    通过关键词匹配判断用户问题是否需要查询数据库。
+    要求：至少命中 2 个数据库查询关键词，或命中特定强模式。
+    """
+    query_lower = query.strip().lower()
+    hit_count = sum(1 for kw in DB_QUERY_KEYWORDS if kw in query_lower)
+    
+    # 强模式：包含明确的数据库查询意图
+    strong_patterns = [
+        r'(查询|统计|列出|显示).*(数据|信息|记录|表)',
+        r'(播放量|弹幕|时长|视频).*(最多|最少|最高|最低|排名|排行|top)',
+        r'(多少|几个).*(视频|数据)',
+        r'(前|top)\s*\d+',
+        r'(平均|总计|总共|一共)',
+    ]
+    for pattern in strong_patterns:
+        if re.search(pattern, query_lower):
+            logger.debug(f"数据库查询强模式命中: {query} -> database")
+            return QueryType.DATABASE
+    
+    # 柔性匹配：至少 2 个关键词命中
+    if hit_count >= 2:
+        logger.debug(f"数据库查询关键词命中({hit_count}个): {query} -> database")
+        return QueryType.DATABASE
+    
+    return None
+
+
+def _check_general_or_rag(query: str) -> Optional[QueryType]:
+    """启发式：通用常识 vs 知识库检索"""
+    query_lower = query.strip().lower()
+    has_kb_kw = any(kw in query_lower for kw in KB_KEYWORDS)
+    
+    if has_kb_kw:
+        return None  # 有知识库关键词，交给 LLM 判断
+    
+    for pattern in GENERAL_PATTERNS:
+        if re.match(pattern, query_lower):
+            logger.debug(f"通用常识模式命中: {query} -> general")
+            return QueryType.GENERAL
+    
+    return None
+
+
 # ========== 第二层：LLM 分类（准确，有少量成本） ==========
 
-CLASSIFY_PROMPT = """你是一个查询分类器。请判断用户的问题属于以下哪一类：
+CLASSIFY_PROMPT = """你是查询分类器。判断用户问题属于哪一类，只回答分类名：
 
-1. rag — 需要从特定知识库中检索信息才能准确回答的问题。例如：关于特定产品、文档、项目、技术细节、课程内容的问题。
-2. chitchat — 闲聊、问候、情感表达、与知识库无关的日常对话。
-3. general — 通用知识问题，不需要特定知识库，用通用知识就能回答。例如：什么是Python、太阳系有几颗行星、如何学习编程。
+rag — 问题涉及特定文档、项目、产品、内部资料，不检索就无法准确回答
+chitchat — 闲聊、问候、情感、日常对话、寒暄
+general — 通用常识，不涉及任何特定文档即可回答
+database — 需要查询数据库中的结构化数据才能回答，涉及统计、排序、筛选、排名等操作
 
-只回答一个类别名（rag / chitchat / general），不要解释。
+重要：如果问题没有提到具体的文档、项目、产品、知识库，就不要分类为 rag！
+如果问题是关于数据统计、排名、查询具体数据（如播放量、数量、列表等），分类为 database！
+
+示例：
+"系统架构是什么样的" → rag
+"这个项目的数据库用的什么" → rag
+"RAG 是什么" → general
+"你好" → chitchat
+"今天心情不错" → chitchat
+"如何学习编程" → general
+"知识库里有哪些文档" → rag
+"谢谢" → chitchat
+"Python怎么学" → general
+"项目用了什么技术栈" → rag
+"播放量最多的视频是什么" → database
+"统计一下弹幕数量前10的视频" → database
+"有哪些视频时长超过10分钟" → database
+"视频平均播放量是多少" → database
 
 用户问题：{query}
-类别："""
+分类："""
 
 
 def llm_classify(query: str) -> QueryType:
@@ -106,7 +196,7 @@ def llm_classify(query: str) -> QueryType:
             "model": settings.llm_model_name,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
-            "max_tokens": 10,
+            "max_tokens": 15,
             "stream": False
         }
         
@@ -116,17 +206,24 @@ def llm_classify(query: str) -> QueryType:
             data = resp.json()
             content = data["choices"][0]["message"]["content"].strip().lower()
         
-        # 解析分类结果
-        if content in ("rag", "chitchat", "general"):
-            logger.debug(f"LLM 分类: {query} -> {content}")
+        # 解析分类结果（多策略匹配，兼容模型输出格式不一致的情况）
+        # 1. 精确匹配
+        if content in ("rag", "chitchat", "general", "database"):
             return QueryType(content)
         
-        # 尝试从响应中提取关键词
-        if "chitchat" in content or "闲聊" in content:
+        # 2. 去除常见前缀后匹配（如 "类别：rag"、"分类: chitchat"）
+        cleaned = re.sub(r'^(类别|分类|答案|结果|类型|回答)[：:]\s*', '', content).strip()
+        if cleaned in ("rag", "chitchat", "general", "database"):
+            return QueryType(cleaned)
+        
+        # 3. 从响应中提取第一个匹配的关键词
+        if "chitchat" in content or "闲聊" in content or "聊天" in content or "问候" in content:
             return QueryType.CHITCHAT
-        elif "general" in content or "通用" in content:
+        if "general" in content or "通用" in content or "常识" in content:
             return QueryType.GENERAL
-        elif "rag" in content or "知识" in content:
+        if "database" in content or "数据库" in content or "sql" in content or "查询" in content:
+            return QueryType.DATABASE
+        if "rag" in content or "检索" in content or "知识库" in content:
             return QueryType.RAG
             
     except Exception as e:
@@ -136,12 +233,14 @@ def llm_classify(query: str) -> QueryType:
 
 
 def route_query(query: str) -> QueryType:
-    """混合路由入口：先规则，再 LLM
+    """混合路由入口：先规则，再数据库检测，再 LLM
     
     路由策略：
     1. 先进行规则匹配（零成本）
-    2. 规则未命中时使用 LLM 分类
-    3. LLM 分类失败时默认走 RAG
+    2. 数据库查询检测（关键词匹配，零成本）
+    3. 通用常识启发式
+    4. LLM 分类
+    5. 分类失败默认走 RAG
     
     Args:
         query: 用户查询文本
@@ -155,7 +254,19 @@ def route_query(query: str) -> QueryType:
         logger.info(f"查询路由 [规则]: {query[:50]}... -> {result.value}")
         return result
     
-    # 第二层：LLM 分类
+    # 第二层：数据库查询检测（Text-to-SQL）
+    result = _check_database_query(query)
+    if result is not None:
+        logger.info(f"查询路由 [数据库]: {query[:50]}... -> {result.value}")
+        return result
+    
+    # 第三层：通用常识启发式
+    result = _check_general_or_rag(query)
+    if result is not None:
+        logger.info(f"查询路由 [启发式]: {query[:50]}... -> {result.value}")
+        return result
+    
+    # 第四层：LLM 分类
     result = llm_classify(query)
     logger.info(f"查询路由 [LLM]: {query[:50]}... -> {result.value}")
     return result

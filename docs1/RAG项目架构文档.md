@@ -1,11 +1,11 @@
-# 知识问答系统 架构设计文档 v3.0
+# 知识问答系统 架构设计文档 v3.3
 
 ## 文档信息
 
 | 项目 | 内容 |
 |------|------|
 | **文档名称** | 知识问答系统架构设计文档 |
-| **版本** | v3.0 |
+| **版本** | v3.3 |
 | **更新日期** | 2026-06-20 |
 | **仓库地址** | [https://github.com/yhwz131/-RAG-](https://github.com/yhwz131/-RAG-) |
 | **技术栈** | FastAPI + Vue 3 + Milvus + RAG |
@@ -25,9 +25,9 @@
 | 功能 | 描述 |
 |------|------|
 | **智能问答** | 基于 RAG 的上下文增强问答，支持流式输出 |
-| **查询路由** | 规则 + LLM 混合路由，自动区分 rag/chitchat/general 三类查询 |
+| **查询路由** | 规则 + 启发式 + LLM 三层路由，自动区分 rag/chitchat/general 三类查询 |
 | **文档管理** | 批量上传、解析、切片、向量化入库，文件大小校验，失败自动清理 |
-| **数据管线** | 三种处理引擎（快速/Spark 批量/数据库导入），文件级去重，自动入库 |
+| **数据管线** | 三种处理引擎（快速/Spark 批量/MySQL 导入），前端可视化配置 MySQL，文件级去重 + 数据库替换式去重，自动入库 |
 | **多模态检索** | 纯文本链路 (bge-large-zh) + 多模态链路 (Qwen3-VL-Embedding) |
 | **混合检索** | 向量检索 + BM25 关键词检索 + RRF 融合排序，相似度阈值过滤 |
 | **对话记忆** | 多轮对话上下文管理，轮次 + token 双重截断，会话持久化 |
@@ -42,7 +42,7 @@
 │  ┌───────────────────────────────────────────────────────────────┐  │
 │  │  frontend/ — Vue 3 + TypeScript + Vite + Element Plus         │  │
 │  │  ├── views/ChatView.vue    对话页面（流式问答 + 会话管理）     │  │
-│  │  ├── views/DocsView.vue   文档管理（批量上传 + 统计）         │  │
+│  │  ├── views/DocsView.vue   文档管理（批量上传 + MySQL 配置 + 统计）│  │
 │  │  ├── stores/chat.ts       Pinia 状态管理                      │  │
 │  │  ├── stores/theme.ts      主题切换（暗黑/明亮）               │  │
 │  │  └── api/index.ts         API 客户端封装                      │  │
@@ -60,7 +60,7 @@
 │  └───────────────┘  └───────────────┘  └───────────────────────┘   │
 │  ┌───────────────┐  ┌───────────────────────────────────────────┐  │
 │  │ routes_health │  │ routes_pipeline                           │  │
-│  │ 健康检查      │  │ 数据管线：处理/状态/历史/数据库导入      │  │
+│  │ 健康检查      │  │ 数据管线：处理/状态/历史/MySQL 配置与导入 │  │
 │  └───────────────┘  └───────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
                     │               │               │
@@ -81,8 +81,8 @@
 │                    数据管线层 (Pipeline)                               │
 │  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────────┐  │
 │  │  SimpleEngine    │  │  SparkEngine      │  │  DatabaseSource     │  │
-│  │  快速单机处理    │  │  PySpark 批量处理  │  │  SQL 数据库导入     │  │
-│  │  文件级 MD5 去重 │  │  文件级 MD5 去重   │  │  表/SQL 查询导入    │  │
+│  │  快速单机处理    │  │  PySpark 批量处理  │  │  MySQL 数据导入    │  │
+│  │  文件级 MD5 去重 │  │  文件级 MD5 去重   │  │  数据清洗+替换式去重│  │
 │  └─────────────────┘  └──────────────────┘  └─────────────────────┘  │
 │  ┌─────────────────────────────────────────────────────────────────┐  │
 │  │  PipelineService — 管线编排：保存文件 → 选引擎 → 处理 → 入库   │  │
@@ -156,7 +156,8 @@
 |------|------|----------|
 | **bge-large-zh-v1.5** | 文本 Embedding (1024 维) | API 调用 (SiliconFlow) |
 | **Qwen3-VL-Embedding-8B** | 多模态 Embedding (4096 维) | API 调用 / 本地部署 |
-| **mimo-v2.5** | 大语言模型（问答生成） | API 调用 |
+| **mimo-v2.5** | 大语言模型（纯文本链路问答生成 + 查询路由分类） | API 调用 |
+| **mimo-v2-omni** | 多模态大语言模型（多模态链路，支持图片理解 + 图片描述生成） | API 调用（同端点，仅模型名不同） |
 
 ---
 
@@ -169,7 +170,7 @@ knowledge-qa-system/
 │   ├── routes_chat.py              # 对话接口（流式/非流式，会话管理）
 │   ├── routes_docs.py              # 文档管理接口（上传/批量上传/列表/删除）
 │   ├── routes_health.py            # 健康检查接口
-│   ├── routes_pipeline.py          # 数据管线接口（处理/状态/历史/数据库导入）
+│   ├── routes_pipeline.py          # 数据管线接口（处理/状态/历史/MySQL 配置与导入）
 │   └── pipeline/                   # 管线模块
 │       ├── __init__.py
 │       ├── service.py              # 管线服务编排器（保存→选引擎→处理→入库）
@@ -179,7 +180,7 @@ knowledge-qa-system/
 │           ├── __init__.py
 │           ├── simple.py           # 快速引擎：单机顺序处理 + 文件级 MD5 去重
 │           ├── spark_engine.py     # Spark 引擎：PySpark 并行处理 + 文件级 MD5 去重
-│           └── database.py         # 数据库引擎：SQL 表/查询导入
+│           └── database.py         # MySQL/PostgreSQL 数据源引擎
 │
 ├── config/                         # 配置管理
 │   ├── __init__.py
@@ -214,7 +215,7 @@ knowledge-qa-system/
 │   │   ├── api/index.ts            # API 客户端封装（对话/文档/管线/健康检查）
 │   │   ├── views/
 │   │   │   ├── ChatView.vue        # 对话页面（流式问答 + 会话管理）
-│   │   │   ├── DocsView.vue        # 文档管理页面（上传 + 管线统计 + 处理历史）
+│   │   │   ├── DocsView.vue        # 文档管理页面（上传 + 管线统计 + MySQL 配置 + 处理历史）
 │   │   │   └── AdminView.vue       # 管线状态页（已整合到 DocsView，/admin 重定向到 /files）
 │   │   ├── stores/
 │   │   │   ├── chat.ts             # 对话状态管理
@@ -272,7 +273,8 @@ knowledge-qa-system/
 ┌─────────────────────────────────────────────────────────┐
 │ 2. 查询路由 (router.py)                                  │
 │    - 第一层：规则匹配（正则，零成本 <1ms）                │
-│    - 第二层：LLM 分类（mimo-v2.5，~50 token）             │
+│    - 第 1.5 层：启发式分类（通用常识模式 + 知识库关键词） │
+│    - 第二层：LLM 分类（mimo-v2.5，few-shot 示例）       │
 │    - 返回 QueryType: rag / chitchat / general            │
 │    - 兜底：LLM 分类失败默认走 rag                        │
 └─────────────────────────┬───────────────────────────────┘
@@ -320,7 +322,9 @@ knowledge-qa-system/
 │      · 闲聊: CHITCHAT_SYSTEM_PROMPT                      │
 │      · 通用: GENERAL_SYSTEM_PROMPT                       │
 │    - 历史对话（轮次 + token 双重截断）+ 当前问题         │
-│    - 调用 mimo-v2.5 API，支持同步/流式                   │
+│    - 纯文本链路: 调用 mimo-v2.5 API                      │
+│    - 多模态链路: 调用 mimo-v2-omni API（支持图片）       │
+│    - 支持同步/流式                                       │
 └─────────────────────────┬───────────────────────────────┘
                           │
                           ▼
@@ -333,7 +337,43 @@ knowledge-qa-system/
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 双链路检索架构
+### 4.2 查询路由架构
+
+路由采用三层渐进式分类，兼顾速度和准确率：
+
+```
+用户 Query
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ 第一层：规则匹配（<1ms，零成本）                         │
+│    - GREETING_PATTERNS: 问候语（你好/在吗/谢谢 等）      │
+│    - SMALL_TALK_PATTERNS: 闲聊（心情/天气/早晚安 等）    │
+│    - 命中 → chitchat，未命中 → 下一层                    │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│ 第 1.5 层：启发式分类（<1ms，零成本）                    │
+│    - GENERAL_PATTERNS: 通用常识模式                      │
+│      · "如何/怎么 学习/入门/精通..."                     │
+│      · "什么是/什么叫 ..."                               │
+│    - KB_KEYWORDS: 知识库关键词检测                       │
+│      · 出现"知识库/文档/项目/系统/架构/论文"等 → 交 LLM  │
+│    - 无知识库关键词 + 匹配通用模式 → general             │
+│    - 有知识库关键词或未匹配 → 下一层                     │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│ 第二层：LLM 分类（~1s，mimo-v2.5）                      │
+│    - few-shot 示例（rag/chitchat/general 各 2-3 个）    │
+│    - 解析策略: 精确匹配 → 去前缀 → 关键词匹配           │
+│    - 兜底: 分类失败默认 rag                              │
+└─────────────────────────┘
+```
+
+### 4.3 双链路检索架构
 
 ```
                     用户 Query
@@ -360,7 +400,7 @@ knowledge-qa-system/
                合并结果 → LLM 生成
 ```
 
-### 4.3 文档处理流程
+### 4.4 文档处理流程
 
 ```
 用户上传文件（支持批量）
@@ -405,10 +445,58 @@ knowledge-qa-system/
 │    - 纯文本链路: embedder → knowledge_base│
 │    - 多模态链路: embedder → knowledge_base_mm│
 │    - 文档图片: extract_images → mm 链路  │
-│    - 图片描述: mimo-v2.5 vision 生成     │
+│    - 图片描述: mimo-v2-omni vision 生成    │
 │    - chunk_id 去重: 防止重复入库         │
 └─────────────────────────────────────────┘
 ```
+
+### 4.5 Text-to-SQL 数据库查询流程
+
+```
+用户在聊天界面提问（如"播放量最多的视频是什么"）
+        │
+        ▼
+┌─────────────────────────────────────────┐
+│ 1. 查询路由（router.py）                │
+│    - 规则匹配 → 数据库关键词检测        │
+│    - LLM 分类 → database 类型           │
+└─────────────────┬───────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────┐
+│ 2. 获取表结构（database.py）            │
+│    - 连接 MySQL/PostgreSQL              │
+│    - get_schema_for_llm() 返回表描述    │
+└─────────────────┬───────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────┐
+│ 3. LLM 生成 SQL                         │
+│    - 输入：表结构 + 用户问题            │
+│    - 输出：SELECT 查询语句              │
+│    - 安全校验：只允许 SELECT，禁止 DDL  │
+└─────────────────┬───────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────┐
+│ 4. 执行 SQL 并格式化结果                │
+│    - execute_sql() 安全执行             │
+│    - 结果转为 Markdown 表格             │
+└─────────────────┬───────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────┐
+│ 5. LLM 总结回答                         │
+│    - 输入：原始问题 + SQL + 查询结果    │
+│    - 输出：自然语言回答                 │
+└─────────────────────────────────────────┘
+```
+
+**关键设计：**
+- **不入库**：数据库结构化数据直接用 SQL 查询，不再向量化导入 Milvus
+- **安全校验**：`validate_sql()` 只允许 SELECT，拦截 INSERT/DELETE/DROP 等危险操作
+- **两轮 LLM**：第一轮生成 SQL，第二轮总结回答，各司其职
+- **路由优先级**：数据库关键词匹配优先于通用常识启发式，避免被误分类为 general
 
 ---
 
@@ -418,11 +506,31 @@ knowledge-qa-system/
 
 | 方法 | 路径 | 描述 |
 |------|------|------|
-| POST | `/api/chat` | 发送消息（支持 stream/non-stream） |
+| POST | `/api/chat` | 发送消息（支持 stream/non-stream，支持上传图片和文档） |
 | POST | `/api/chat/clear` | 清空指定会话历史 |
 | GET | `/api/chat/sessions` | 获取所有会话列表 |
 | GET | `/api/chat/{session_id}` | 获取指定会话历史 |
 | DELETE | `/api/chat/{session_id}` | 删除指定会话 |
+
+**POST `/api/chat` 请求体：**
+
+```typescript
+{
+  query: string           // 用户问题
+  session_id?: string     // 会话 ID（可选，不传则新建）
+  stream?: boolean        // 是否流式（默认 false）
+  mode?: string           // 检索模式："text" | "multimodal"
+  images?: string[]       // 图片列表（base64 编码，不含 data:image 前缀）
+  files?: {               // 文档列表（base64 编码）
+    name: string          // 文件名（含扩展名，用于判断格式）
+    content: string       // base64 编码的文件内容
+  }[]
+}
+```
+
+- **图片**：以 base64 发送给多模态模型（mimo-v2-omni），用于图文理解
+- **文档**：后端解码后通过 `file_parser` 提取文本，拼接到查询上下文中
+- 支持格式：图片（JPEG/PNG/GIF/WebP）、文档（PDF/Word/PPT/Excel/TXT/MD/CSV）
 
 ### 5.2 文档管理接口 `/api/docs`
 
@@ -447,9 +555,11 @@ knowledge-qa-system/
 | GET | `/api/pipeline/tasks/{id}` | 获取指定任务状态 |
 | GET | `/api/pipeline/quality` | 获取数据质量报告 |
 | GET | `/api/pipeline/database/status` | 获取数据库连接状态 |
+| GET | `/api/pipeline/database/config` | 获取数据库配置（密码脱敏） |
 | GET | `/api/pipeline/database/tables` | 获取数据库表信息 |
-| POST | `/api/pipeline/database/test` | 测试数据库连接 |
-| POST | `/api/pipeline/database/import` | 从数据库导入数据 |
+| POST | `/api/pipeline/database/test` | 测试数据库连接（支持传入临时配置） |
+| POST | `/api/pipeline/database/config` | 保存数据库配置到 `.env` 并重建数据源 |
+| POST | `/api/pipeline/database/import` | 从 MySQL 导入数据 |
 
 ### 5.4 系统接口
 
@@ -511,6 +621,7 @@ RRF_K=60                    # RRF 融合参数
 LLM_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
 LLM_API_KEY=your-api-key-here
 LLM_MODEL_NAME=mimo-v2.5
+MM_LLM_MODEL_NAME=mimo-v2-omni
 LLM_TEMPERATURE=0.7
 LLM_MAX_TOKENS=2048
 LLM_TIMEOUT=120.0
@@ -528,6 +639,16 @@ API_PORT=8000
 
 # ========== 日志 ==========
 LOG_LEVEL=INFO
+
+# ========== MySQL 数据接入（前端可配置） ==========
+DB_TYPE=mysql            # mysql / postgresql
+DB_HOST=localhost
+DB_PORT=3306
+DB_USER=root
+DB_PASSWORD=your-password
+DB_NAME=your-database
+DB_TABLE=your-table
+DB_TEXT_COLUMNS=title,content  # 逗号分隔的文本列名
 ```
 
 ### 6.2 配置优先级
@@ -549,7 +670,7 @@ LOG_LEVEL=INFO
 | `/` | 重定向 | → `/chat` |
 | `/chat` | ChatView | 对话页面（欢迎页 + 快捷提问） |
 | `/chat/:sessionId` | ChatView | 指定会话 |
-| `/files` | DocsView | 文档管理（上传 + 管线统计 + 处理历史 + 数据库导入） |
+| `/files` | DocsView | 文档管理（上传 + 管线统计 + 处理历史 + MySQL 配置与导入） |
 | `/admin` | 重定向 | → `/files`（Admin 页面已整合到文档管理） |
 
 ### 7.2 状态管理 (Pinia)
@@ -562,6 +683,9 @@ LOG_LEVEL=INFO
 - `loading` — 是否等待回复
 - `mode` — 检索模式 (text / multimodal)
 - `sidebarCollapsed` — 侧边栏折叠状态
+- `pendingFiles[]` — 待发送文件列表（`PendingFile`：id / file / preview / base64 / isImage / fileName）
+- `addPendingFiles(files)` — 添加待发送文件（自动区分图片和文档）
+- `removePendingFile(id)` / `clearPendingFiles()` — 移除/清空待发送文件
 
 **theme store**：
 - `theme` — 当前主题 (dark / light)
@@ -573,12 +697,15 @@ LOG_LEVEL=INFO
 前端通过 `axios` (非流式) 和 `fetch` (流式) 两种方式调用后端：
 
 ```typescript
-// 流式对话
-chatStream(query, sessionId, mode, onSources, onToken, onDone, onError)
+// 流式对话（支持上传图片和文档）
+chatStream(query, sessionId, mode, onSources, onToken, onDone, onError, images?, files?)
 
 // 批量上传
 uploadDocuments(files: File[]): Promise<BatchUploadResult>
 ```
+
+**文件上传**：对话界面支持拖拽或点击上传图片（JPEG/PNG/GIF/WebP）和文档（PDF/Word/PPT/Excel/TXT/MD/CSV）。
+图片以 base64 发送给多模态模型；文档在后端解码后通过 `file_parser` 提取文本，作为查询上下文拼接到 prompt 中。
 
 ### 7.4 主题系统
 

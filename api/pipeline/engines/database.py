@@ -1,13 +1,47 @@
 """
 数据库数据源引擎
-支持 MySQL / PostgreSQL 数据接入
+支持 MySQL / PostgreSQL 数据接入（含 Text-to-SQL 安全执行）
 """
-from typing import List, Dict, Any, Optional
+import re
+from typing import List, Dict, Any, Optional, Tuple
 from ..adapter import DatabaseSource
 from config.settings import settings
 from utils.logger import get_logger
 
 logger = get_logger("pipeline.database")
+
+
+# ========== SQL 安全校验 ==========
+
+# 允许的 SQL 语句前缀（只读操作）
+_ALLOWED_SQL_PREFIXES = ("select", "with")
+# 禁止的关键词（防止注入）
+_DANGEROUS_KEYWORDS = [
+    "insert", "update", "delete", "drop", "alter", "create", "truncate",
+    "grant", "revoke", "rename", "replace", "merge", "call", "exec",
+    "execute", "xp_", "sp_", "into outfile", "into dumpfile",
+    "lock table", "unlock table",
+]
+
+
+def validate_sql(sql: str) -> Tuple[bool, str]:
+    """校验 SQL 是否为安全的只读查询
+    
+    Returns:
+        (is_safe, error_message): is_safe=True 表示安全
+    """
+    sql_clean = sql.strip().rstrip(";").strip().lower()
+    
+    # 检查是否以允许的前缀开头
+    if not any(sql_clean.startswith(prefix) for prefix in _ALLOWED_SQL_PREFIXES):
+        return False, f"只允许 SELECT 查询，不允许: {sql_clean[:30]}..."
+    
+    # 检查是否包含危险关键词
+    for kw in _DANGEROUS_KEYWORDS:
+        if re.search(r'\b' + kw + r'\b', sql_clean):
+            return False, f"SQL 包含禁止的操作: {kw}"
+    
+    return True, ""
 
 
 class MySQLSource(DatabaseSource):
@@ -22,7 +56,7 @@ class MySQLSource(DatabaseSource):
         self._password = password or settings.db_password
         self._database = database or settings.db_name
         self._table = table or settings.db_table
-        self._text_columns = text_columns or settings.db_text_columns
+        self._text_columns = text_columns or settings.db_text_columns_list
         self._conn = None
 
     @property
@@ -119,6 +153,58 @@ class MySQLSource(DatabaseSource):
                 pass
             self._conn = None
 
+    def execute_sql(self, sql: str) -> Dict[str, Any]:
+        """安全执行 SQL 查询（只读，带校验）
+        
+        Args:
+            sql: SQL 查询语句
+            
+        Returns:
+            {"columns": [...], "rows": [...], "row_count": int}
+        """
+        is_safe, err = validate_sql(sql)
+        if not is_safe:
+            raise ValueError(f"SQL 安全校验失败: {err}")
+        
+        if not self._conn:
+            if not self.connect():
+                raise ConnectionError("MySQL 连接失败")
+        
+        try:
+            import pymysql
+            with self._conn.cursor(pymysql.cursors.DictCursor) as cursor:
+                cursor.execute(sql)
+                rows = cursor.fetchall()
+            
+            columns = list(rows[0].keys()) if rows else []
+            safe_rows = []
+            for row in rows:
+                safe_row = {}
+                for k, v in row.items():
+                    if isinstance(v, (int, float, str, bool, type(None))):
+                        safe_row[k] = v
+                    else:
+                        safe_row[k] = str(v)
+                safe_rows.append(safe_row)
+            
+            logger.info(f"SQL 执行成功: {len(safe_rows)} 行, 列={columns}")
+            return {"columns": columns, "rows": safe_rows, "row_count": len(safe_rows)}
+            
+        except Exception as e:
+            logger.error(f"SQL 执行失败: {e}")
+            raise
+
+    def get_schema_for_llm(self) -> str:
+        """获取表结构的 LLM 可读描述（用于 SQL 生成 Prompt）"""
+        info = self.get_table_info()
+        parts = []
+        for table in info.get("tables", []):
+            cols = ", ".join(
+                f"{c['name']} {c['type']}" for c in table.get("columns", [])
+            )
+            parts.append(f"表 {table['name']}（{table['row_count']} 行）: {cols}")
+        return "\n".join(parts)
+
 
 class PostgreSQLSource(DatabaseSource):
     """PostgreSQL 数据源"""
@@ -132,7 +218,7 @@ class PostgreSQLSource(DatabaseSource):
         self._password = password or settings.db_password
         self._database = database or settings.db_name
         self._table = table or settings.db_table
-        self._text_columns = text_columns or settings.db_text_columns
+        self._text_columns = text_columns or settings.db_text_columns_list
         self._conn = None
 
     @property
@@ -236,6 +322,52 @@ class PostgreSQLSource(DatabaseSource):
             except Exception:
                 pass
             self._conn = None
+
+    def execute_sql(self, sql: str) -> Dict[str, Any]:
+        """安全执行 SQL 查询（只读，带校验）"""
+        is_safe, err = validate_sql(sql)
+        if not is_safe:
+            raise ValueError(f"SQL 安全校验失败: {err}")
+        
+        if not self._conn:
+            if not self.connect():
+                raise ConnectionError("PostgreSQL 连接失败")
+        
+        try:
+            import psycopg2
+            import psycopg2.extras
+            with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                cursor.execute(sql)
+                rows = [dict(r) for r in cursor.fetchall()]
+            
+            columns = list(rows[0].keys()) if rows else []
+            safe_rows = []
+            for row in rows:
+                safe_row = {}
+                for k, v in row.items():
+                    if isinstance(v, (int, float, str, bool, type(None))):
+                        safe_row[k] = v
+                    else:
+                        safe_row[k] = str(v)
+                safe_rows.append(safe_row)
+            
+            logger.info(f"SQL 执行成功: {len(safe_rows)} 行, 列={columns}")
+            return {"columns": columns, "rows": safe_rows, "row_count": len(safe_rows)}
+            
+        except Exception as e:
+            logger.error(f"SQL 执行失败: {e}")
+            raise
+
+    def get_schema_for_llm(self) -> str:
+        """获取表结构的 LLM 可读描述（用于 SQL 生成 Prompt）"""
+        info = self.get_table_info()
+        parts = []
+        for table in info.get("tables", []):
+            cols = ", ".join(
+                f"{c['name']} {c['type']}" for c in table.get("columns", [])
+            )
+            parts.append(f"表 {table['name']}（{table['row_count']} 行）: {cols}")
+        return "\n".join(parts)
 
 
 def create_database_source(db_type: str = "") -> Optional[DatabaseSource]:

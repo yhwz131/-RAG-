@@ -3,11 +3,18 @@
 """
 import os
 import uuid
+import base64
+import tempfile
+from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from rag.chain import RAGChain
+from utils.file_parser import FileParser
+from utils.logger import get_logger
+
+logger = get_logger("routes_chat")
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -26,11 +33,19 @@ def set_mm_rag_chain(chain: RAGChain):
     mm_rag_chain = chain
 
 
+class ChatFile(BaseModel):
+    """用户上传的文件"""
+    name: str       # 文件名
+    content: str    # base64 编码内容
+
+
 class ChatRequest(BaseModel):
     query: str
     session_id: Optional[str] = None
     stream: bool = False
     mode: str = "text"  # "text" 或 "multimodal"
+    images: List[str] = []       # 用户上传的图片列表（base64 编码，不含 data:image 前缀）
+    files: List[ChatFile] = []   # 用户上传的文档列表（base64 编码）
 
 
 class ChatResponse(BaseModel):
@@ -54,16 +69,45 @@ async def chat(req: ChatRequest):
     else:
         active_chain = rag_chain
 
+    # 处理上传的文档文件 → 提取文本作为上下文
+    file_context = None
+    if req.files:
+        file_texts = []
+        for f in req.files:
+            try:
+                suffix = Path(f.name).suffix.lower()
+                if suffix not in FileParser.SUPPORTED_FORMATS:
+                    logger.warning(f"不支持的文件格式: {f.name}")
+                    continue
+                # base64 → 临时文件 → 解析
+                raw = base64.b64decode(f.content)
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(raw)
+                    tmp_path = tmp.name
+                try:
+                    text = FileParser.parse(tmp_path)
+                    # 限制单个文件长度，防止上下文爆炸
+                    if len(text) > 5000:
+                        text = text[:5000] + "\n...(内容过长已截断)"
+                    file_texts.append(f"[文件: {f.name}]\n{text}")
+                    logger.info(f"解析上传文件成功: {f.name}, {len(text)} 字符")
+                finally:
+                    os.unlink(tmp_path)
+            except Exception as e:
+                logger.warning(f"解析文件 {f.name} 失败: {e}")
+        if file_texts:
+            file_context = "\n\n".join(file_texts)
+
     if req.stream:
         # 流式返回
         async def generate():
-            for chunk in active_chain.chat(req.query, session_id, stream=True):
+            for chunk in active_chain.chat(req.query, session_id, stream=True, images=req.images, file_context=file_context):
                 yield chunk
         
         return StreamingResponse(generate(), media_type="text/plain")
     
     # 非流式
-    answer, docs, query_type = active_chain.chat(req.query, session_id, stream=False)
+    answer, docs, query_type = active_chain.chat(req.query, session_id, stream=False, images=req.images, file_context=file_context)
     refs = []
     for d in docs:
         ref = {
