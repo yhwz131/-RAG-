@@ -7,6 +7,7 @@
 | **文档名称** | RAG 优化建议文档 |
 | **版本** | v2.0 |
 | **日期** | 2026-06-19 |
+| **仓库地址** | [https://github.com/yhwz131/-RAG-](https://github.com/yhwz131/-RAG-) |
 | **定位** | 针对当前系统 RAG 功能链路的全面分析与优化方案，含 LangGraph 多 Agent 升级规划 |
 
 ---

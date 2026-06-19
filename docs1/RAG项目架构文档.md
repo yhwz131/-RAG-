@@ -7,6 +7,7 @@
 | **文档名称** | 知识问答系统架构设计文档 |
 | **版本** | v2.1 |
 | **更新日期** | 2026-06-19 |
+| **仓库地址** | [https://github.com/yhwz131/-RAG-](https://github.com/yhwz131/-RAG-) |
 | **技术栈** | FastAPI + Vue 3 + Milvus + RAG |
 | **描述** | 基于 RAG 的多模态知识问答系统整体架构设计 |
 
