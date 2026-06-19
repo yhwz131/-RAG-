@@ -1,0 +1,44 @@
+# ========== 核心依赖 ==========
+# FastAPI 相关
+fastapi==0.111.0
+uvicorn==0.27.1
+python-multipart==0.0.9
+
+# 配置管理
+pydantic==2.6.0
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+
+# 向量数据库
+pymilvus==2.3.6
+
+# Embedding & LLM
+httpx==0.26.0
+openai==1.7.1
+
+# 文本切片
+jieba==0.42.1
+
+# 文件解析
+chardet==5.2.0
+PyMuPDF==1.24.0
+python-pptx>=1.0.0
+openpyxl>=3.1.0
+xlrd>=2.0.0
+python-docx==1.1.0
+
+# 混合检索
+rank_bm25==0.2.2
+
+# ========== 数据处理 ==========
+pandas==2.1.4
+
+# ========== 日志 ==========
+loguru==0.7.2
+
+# ========== Spark（可选，大规模数据处理） ==========
+# pyspark==3.5.0
+
+# ========== 测试 ==========
+# pytest==8.0.0
+# pytest-asyncio==0.23.3

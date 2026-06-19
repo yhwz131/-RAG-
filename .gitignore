@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+kbqa/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files
+.env
+
+# Data directories（用户数据，不入库）
+data/uploads/*
+data/processed/*
+data/raw/*
+data/sessions/*
+data/app.log
+data/milvus.db/
+!data/uploads/.gitkeep
+!data/processed/.gitkeep
+!data/raw/.gitkeep
+!data/sessions/.gitkeep
+
+# Logs
+logs/
+*.log
+
+# Frontend build dependencies & output
+frontend/node_modules/
+web/dist/
+
+# 启动脚本 PID 文件
+.pids/
+
+# OS
+.DS_Store
+Thumbs.db
+*.tsbuildinfo

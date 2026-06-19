@@ -1,0 +1,200 @@
+/* ========== 全局样式 ========== */
+:root {
+  --sidebar-width: 280px;
+  --header-height: 56px;
+  --primary-color: #409eff;
+  --bg-dark: #1e1e2e;
+  --bg-darker: #181825;
+  --bg-card: #262637;
+  --text-primary: #e0e0e0;
+  --text-secondary: #a0a0b0;
+  --border-color: #333348;
+  --code-bg: #3a3a4e;
+  --code-color: #e06c75;
+  --pre-bg: #1a1a2e;
+  --scrollbar-thumb: #444;
+  --scrollbar-thumb-hover: #555;
+  --shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+}
+
+/* ========== 明亮主题 ========== */
+[data-theme="light"] {
+  --bg-dark: #f5f7fa;
+  --bg-darker: #ffffff;
+  --bg-card: #ffffff;
+  --text-primary: #303133;
+  --text-secondary: #909399;
+  --border-color: #e4e7ed;
+  --code-bg: #f0f2f5;
+  --code-color: #c41d7f;
+  --pre-bg: #f6f8fa;
+  --scrollbar-thumb: #c0c4cc;
+  --scrollbar-thumb-hover: #909399;
+  --shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  height: 100%;
+  width: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  background: var(--bg-dark);
+  color: var(--text-primary);
+}
+
+/* ========== Markdown 渲染 ========== */
+.markdown-body {
+  line-height: 1.7;
+  word-wrap: break-word;
+  font-size: 14px;
+}
+
+.markdown-body p {
+  margin-bottom: 8px;
+}
+
+.markdown-body p:last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body code {
+  background: var(--code-bg);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: 'Fira Code', 'Consolas', monospace;
+  color: var(--code-color);
+}
+
+.markdown-body pre {
+  background: var(--pre-bg);
+  border-radius: 8px;
+  padding: 16px;
+  overflow-x: auto;
+  margin: 12px 0;
+  border: 1px solid var(--border-color);
+}
+
+.markdown-body pre code {
+  background: none;
+  padding: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.markdown-body h1, .markdown-body h2, .markdown-body h3,
+.markdown-body h4, .markdown-body h5, .markdown-body h6 {
+  margin: 16px 0 8px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.markdown-body h1 { font-size: 1.5em; }
+.markdown-body h2 { font-size: 1.3em; }
+.markdown-body h3 { font-size: 1.15em; }
+
+.markdown-body ul, .markdown-body ol {
+  padding-left: 24px;
+  margin: 8px 0;
+}
+
+.markdown-body li {
+  margin: 4px 0;
+}
+
+.markdown-body blockquote {
+  border-left: 4px solid var(--primary-color);
+  padding: 8px 16px;
+  margin: 12px 0;
+  background: rgba(64, 158, 255, 0.08);
+  border-radius: 0 6px 6px 0;
+  color: var(--text-secondary);
+}
+
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+}
+
+.markdown-body th, .markdown-body td {
+  border: 1px solid var(--border-color);
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.markdown-body th {
+  background: var(--bg-card);
+  font-weight: 600;
+}
+
+.markdown-body img {
+  max-width: 100%;
+  border-radius: 8px;
+  margin: 8px 0;
+}
+
+.markdown-body a {
+  color: var(--primary-color);
+  text-decoration: none;
+}
+
+.markdown-body a:hover {
+  text-decoration: underline;
+}
+
+.markdown-body hr {
+  border: none;
+  border-top: 1px solid var(--border-color);
+  margin: 16px 0;
+}
+
+.markdown-body strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* ========== 滚动条 ========== */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+/* ========== Element Plus 深色主题覆盖 ========== */
+.el-button--primary {
+  --el-button-bg-color: #409eff;
+}
+
+/* Transition */
+.fade-enter-active, .fade-leave-active {
+  transition: opacity 0.2s ease;
+}
+.fade-enter-from, .fade-leave-to {
+  opacity: 0;
+}
+
+/* ========== 主题切换过渡 ========== */
+*,
+*::before,
+*::after {
+  transition: background-color 0.3s ease, border-color 0.3s ease, color 0.2s ease;
+}
