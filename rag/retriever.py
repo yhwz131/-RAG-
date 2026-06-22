@@ -2,7 +2,9 @@
 检索模块
 基于 Milvus Lite 本地向量数据库进行相似度搜索，支持混合检索（向量 + BM25）
 """
+import os
 import hashlib
+import base64
 import httpx
 from typing import List, Dict, Optional
 from pymilvus import MilvusClient
@@ -538,60 +540,186 @@ class MultimodalRetriever:
         self._update_bm25_cache()
         return len(data)
 
-    def _generate_image_description(self, image_b64: str, source: str, page: int) -> str:
+    def refresh_image_descriptions(self, source: str = None) -> int:
+        """刷新图片描述：为没有有效描述的图片重新生成描述
+
+        Args:
+            source: 指定来源文件名（可选），为空则刷新所有图片
+
+        Returns:
+            成功刷新的图片数量
+        """
+        # 查询所有图片记录（chunk_index == -1 表示图片块）
+        filter_expr = 'chunk_index == -1'
+        if source:
+            filter_expr = f'chunk_index == -1 and filename == "{source}"'
+
+        try:
+            results = self._client.query(
+                self.collection_name,
+                filter=filter_expr,
+                output_fields=["id", "chunk_id", "filename", "content", "page_number", "image_url", "embedding", "has_image", "doc_id", "chunk_index"],
+                limit=1000,
+            )
+        except Exception as e:
+            logger.error(f"查询图片记录失败: {e}")
+            return 0
+
+        if not results:
+            logger.info("未找到需要刷新的图片记录")
+            return 0
+
+        # 识别需要刷新的图片：content 为默认标签或包含失败关键词
+        failure_keywords = ["无法看到", "无法识别", "抱歉", "对不起", "请重新上传"]
+        need_refresh = []
+        for r in results:
+            content = r.get("content", "")
+            # 默认标签格式: "[图片] 来源: xxx, 第x页" (无实际描述)
+            is_default = content.startswith("[图片] 来源:") and "（来源:" not in content
+            # 包含失败关键词
+            is_failure = any(kw in content for kw in failure_keywords)
+            if is_default or is_failure:
+                need_refresh.append(r)
+
+        if not need_refresh:
+            logger.info(f"所有 {len(results)} 张图片均已有有效描述，无需刷新")
+            return 0
+
+        logger.info(f"找到 {len(need_refresh)} 张需要刷新的图片（共 {len(results)} 张）")
+
+        # 从 image_url 读取图片文件并重新生成描述
+        refreshed = 0
+        for r in need_refresh:
+            chunk_id = r.get("chunk_id", "")
+            filename = r.get("filename", "unknown")
+            page = r.get("page_number", 0)
+            image_url = r.get("image_url", "")
+
+            if not image_url:
+                logger.warning(f"图片无 image_url，跳过: {chunk_id}")
+                continue
+
+            # 读取图片文件并转 base64
+            img_path = image_url
+            if not os.path.isabs(img_path):
+                img_path = os.path.join(os.getcwd(), img_path)
+
+            if not os.path.exists(img_path):
+                logger.warning(f"图片文件不存在，跳过: {img_path}")
+                continue
+
+            try:
+                with open(img_path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("utf-8")
+            except Exception as e:
+                logger.warning(f"读取图片文件失败: {img_path}, {e}")
+                continue
+
+            # 重新生成描述
+            new_desc = self._generate_image_description(b64, filename, page)
+
+            # 更新记录：直接用原始记录（已包含 id、embedding 等全部字段）
+            try:
+                r["content"] = new_desc
+                self._client.upsert(self.collection_name, [r])
+                refreshed += 1
+                logger.info(f"刷新图片描述成功: {filename} 第{page}页")
+            except Exception as e:
+                logger.warning(f"更新图片描述失败: {chunk_id}, {e}")
+
+        logger.info(f"图片描述刷新完成: {refreshed}/{len(need_refresh)} 成功")
+        self._update_bm25_cache()
+        return refreshed
+
+    def _generate_image_description(self, image_b64: str, source: str, page: int, max_retries: int = 2) -> str:
         """用 LLM 生成图片内容描述（vision 能力）
 
         Args:
             image_b64: 图片的 base64 编码
             source: 来源文件名
             page: 页码
+            max_retries: 最大重试次数（默认 2，共尝试 3 次）
 
         Returns:
             图片描述文本，失败时降级为默认标签
         """
-        try:
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {settings.llm_api_key}",
+        # 失败关键词列表：LLM 无法识别图片时的常见回复
+        failure_keywords = [
+            "无法看到", "无法识别", "无法查看", "无法分析",
+            "没有看到", "没有收到", "没有找到", "没有办法",
+            "未收到", "未提供",
+            "抱歉", "对不起", "请重新上传", "请提供",
+            "cannot see", "cannot identify", "unable to",
+        ]
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {settings.llm_api_key}",
+        }
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "请用中文简要描述这张图片的内容（50字以内），只描述图片核心内容，不要添加额外说明。"
+                        ),
+                    },
+                ],
             }
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{image_b64}"},
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                f"请用中文简要描述这张图片的内容（50字以内），"
-                                f"这是文档《{source}》第{page}页的图片。"
-                                f"只描述图片核心内容，不要添加额外说明。"
-                            ),
-                        },
-                    ],
-                }
-            ]
-            payload = {
-                "model": settings.mm_llm_model,
-                "messages": messages,
-                "max_tokens": 100,
-                "temperature": 0,
-            }
-            with httpx.Client(timeout=30) as client:
-                resp = client.post(
-                    settings.mm_llm_api_url, json=payload, headers=headers
+        ]
+        payload = {
+            "model": settings.mm_llm_model,
+            "messages": messages,
+            "max_tokens": 100,
+            "temperature": 0,
+        }
+
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                with httpx.Client(timeout=30) as client:
+                    resp = client.post(
+                        settings.mm_llm_api_url, json=payload, headers=headers
+                    )
+                    resp.raise_for_status()
+                    desc = resp.json()["choices"][0]["message"]["content"].strip()
+
+                    # 验证描述是否有效（过滤 LLM 无法识别的回复）
+                    desc_lower = desc.lower()
+                    is_failure = any(kw in desc_lower for kw in failure_keywords)
+                    if is_failure:
+                        last_error = f"LLM 返回无效描述: {desc[:50]}"
+                        logger.warning(
+                            f"图片描述生成返回无效内容 (尝试 {attempt + 1}/{max_retries + 1}): "
+                            f"{source} 第{page}页 -> {desc[:80]}"
+                        )
+                        continue  # 重试
+
+                    # 有效描述
+                    logger.info(
+                        f"图片描述生成成功: {source} 第{page}页 -> {desc[:50]}..."
+                    )
+                    return f"[图片] {desc}（来源: {source}, 第{page}页）"
+
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(
+                    f"图片描述生成异常 (尝试 {attempt + 1}/{max_retries + 1}): "
+                    f"{source} 第{page}页 -> {e}"
                 )
-                resp.raise_for_status()
-                desc = resp.json()["choices"][0]["message"]["content"].strip()
-                logger.info(
-                    f"图片描述生成成功: {source} 第{page}页 -> {desc[:50]}..."
-                )
-                return f"[图片] {desc}（来源: {source}, 第{page}页）"
-        except Exception as e:
-            logger.warning(f"图片描述生成失败，使用默认标签: {e}")
-            return f"[图片] 来源: {source}, 第{page}页"
+                continue  # 重试
+
+        # 所有重试均失败，降级为默认标签
+        logger.warning(
+            f"图片描述生成最终失败，使用默认标签: {source} 第{page}页, 最后错误: {last_error}"
+        )
+        return f"[图片] 来源: {source}, 第{page}页"
 
     def search(self, query: str, top_k: int = None) -> List[Dict]:
         """多模态混合检索（与 VectorRetriever.search 接口一致）"""

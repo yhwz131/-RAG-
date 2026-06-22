@@ -338,3 +338,24 @@ async def clear_documents():
     except Exception as e:
         logger.error(f"清空文档库失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/refresh-descriptions")
+async def refresh_image_descriptions(source: Optional[str] = None):
+    """刷新图片描述：为没有有效描述的图片重新生成描述
+
+    Args:
+        source: 指定来源文件名（可选），为空则刷新所有图片
+    """
+    if not mm_retriever:
+        raise HTTPException(status_code=503, detail="多模态检索器未初始化")
+
+    try:
+        refreshed = mm_retriever.refresh_image_descriptions(source=source)
+        return {
+            "message": f"图片描述刷新完成",
+            "refreshed": refreshed,
+        }
+    except Exception as e:
+        logger.error(f"刷新图片描述失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
