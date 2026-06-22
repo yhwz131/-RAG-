@@ -40,6 +40,11 @@ class PipelineService:
         self._retriever = None
         self._mm_retriever = None
 
+        # 数据库状态缓存（避免每次查询都尝试连接）
+        self._db_status_cache: Optional[Dict[str, Any]] = None
+        self._db_status_ts: float = 0
+        self._db_status_ttl: float = 60  # 缓存 60 秒
+
         # 注册默认引擎
         self._engines["simple"] = SimpleEngine()
         self._engines["spark"] = SparkEngine()
@@ -96,13 +101,41 @@ class PipelineService:
         return self._db_source
 
     def get_db_status(self) -> Dict[str, Any]:
-        """获取数据库连接状态"""
+        """获取数据库连接状态（读缓存，不主动连接）
+
+        缓存策略：
+        - 用户点击"测试连接"或保存配置时，真实连接并写入缓存
+        - 前端轮询/页面加载时，读缓存，60秒过期后返回"未检测"状态
+        """
+        import time
+
+        if not self._db_source:
+            return {"connected": False, "type": None, "message": "未配置数据库"}
+
+        now = time.time()
+        if self._db_status_cache and (now - self._db_status_ts) < self._db_status_ttl:
+            return self._db_status_cache
+
+        # 缓存过期或无缓存 → 返回"未检测"状态，不主动连接
+        return {
+            "connected": False,
+            "type": self._db_source.source_type,
+            "host": settings.db_host,
+            "database": settings.db_name,
+            "table": settings.db_table,
+            "message": "未检测，请点击测试连接",
+        }
+
+    def test_db_connection(self) -> Dict[str, Any]:
+        """主动测试数据库连接（用户点击时调用，结果写入缓存）"""
+        import time
+
         if not self._db_source:
             return {"connected": False, "type": None, "message": "未配置数据库"}
 
         try:
             connected = self._db_source.connect()
-            return {
+            result = {
                 "connected": connected,
                 "type": self._db_source.source_type,
                 "host": settings.db_host,
@@ -110,7 +143,17 @@ class PipelineService:
                 "table": settings.db_table,
             }
         except Exception as e:
-            return {"connected": False, "type": self._db_source.source_type, "error": str(e)}
+            result = {"connected": False, "type": self._db_source.source_type, "error": str(e)}
+
+        # 写入缓存
+        self._db_status_cache = result
+        self._db_status_ts = time.time()
+        return result
+
+    def invalidate_db_cache(self):
+        """清除数据库状态缓存（配置变更时调用）"""
+        self._db_status_cache = None
+        self._db_status_ts = 0
 
     def save_db_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -179,6 +222,7 @@ class PipelineService:
 
         # 重建数据源
         self._db_source = create_database_source(config.get("db_type", "mysql"))
+        self.invalidate_db_cache()
         logger.info(f"数据库配置已保存并重建数据源: type={config.get('db_type')}")
 
         return {"status": "ok", "message": "数据库配置已保存"}
@@ -336,7 +380,7 @@ class PipelineService:
     # ========== 内部方法 ==========
 
     def _import_to_milvus(self, chunks_file: str) -> int:
-        """将切片数据导入 Milvus"""
+        """将切片数据导入 Milvus（文本 + 多模态双写）"""
         try:
             with open(chunks_file, "r", encoding="utf-8") as f:
                 chunks = json.load(f)
@@ -346,7 +390,15 @@ class PipelineService:
             for c in chunks:
                 if "filename" not in c and "source" in c:
                     c["filename"] = self._strip_uuid_prefix(c["source"])
+            # 写入文本 collection
             count = self._retriever.insert_documents(chunks)
+            # 双写多模态 collection
+            if self._mm_retriever:
+                try:
+                    mm_count = self._mm_retriever.insert_documents(chunks)
+                    logger.info(f"多模态 Collection 同步写入: {mm_count} 条")
+                except Exception as e:
+                    logger.warning(f"多模态入库失败（不影响文本链路）: {e}")
             return count
         except Exception as e:
             logger.error(f"导入 Milvus 失败: {e}")

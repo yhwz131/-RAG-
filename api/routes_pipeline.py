@@ -269,7 +269,7 @@ async def test_database_connection(config: Optional[DatabaseConfigRequest] = Non
     """测试数据库连接（可传入临时配置测试）"""
     try:
         if config:
-            # 用传入的配置临时测试
+            # 用传入的配置临时测试（不写入缓存）
             from api.pipeline.engines.database import MySQLSource, PostgreSQLSource
             if config.db_type == "mysql":
                 source = MySQLSource(
@@ -287,16 +287,17 @@ async def test_database_connection(config: Optional[DatabaseConfigRequest] = Non
                 )
             connected = source.connect()
             source.close()
+            if connected:
+                return {"status": "connected", "type": config.db_type}
+            else:
+                raise HTTPException(status_code=500, detail="连接失败")
         else:
-            db_source = pipeline_service.get_db_source()
-            if not db_source:
-                raise HTTPException(status_code=400, detail="未配置数据库数据源")
-            connected = db_source.connect()
-
-        if connected:
-            return {"status": "connected", "type": config.db_type if config else "mysql"}
-        else:
-            raise HTTPException(status_code=500, detail="连接失败")
+            # 测试当前配置（写入缓存）
+            result = pipeline_service.test_db_connection()
+            if result.get("connected"):
+                return {"status": "connected", "type": result.get("type", "mysql")}
+            else:
+                raise HTTPException(status_code=500, detail=result.get("error", "连接失败"))
     except HTTPException:
         raise
     except Exception as e:

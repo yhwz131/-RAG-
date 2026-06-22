@@ -1,5 +1,19 @@
 # Copilot 项目指令
 
+## ⛔ 强制规则：图片处理
+当用户消息中包含**图片附件**（attachment、粘贴的截图、image.png/jpg 等）时，**必须**在回复前先执行以下步骤：
+1. 获取图片文件的本地路径（附件通常保存在 `/tmp/` 或 workspace 目录下）
+2. 运行命令调用多模态 API 分析图片：
+   ```bash
+   python3 /home/yhwz/knowledge-qa-system/.github/skills/multimodal-image/image_describe.py "<图片路径>" "<用户的问题或默认描述请求>"
+   ```
+3. 将返回的图片描述整合到回答中
+4. 如果脚本报错（API Key 缺失、超时等），告知用户具体原因
+
+> **为什么**：当前基座模型（mimo-v2.5）不支持多模态输入，无法直接理解图片。
+> 必须通过 mimo-v2-omni 模型（同 API 端点，模型名不同）来处理图片。
+> 技能详情参见 `.github/skills/multimodal-image/SKILL.md`
+
 ## 通用规则
 - 始终使用简体中文回复
 - 项目使用 conda 环境 `kbqa`（Python 3.12）

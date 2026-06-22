@@ -66,8 +66,10 @@ async def chat(req: ChatRequest):
     # 根据模式选择链路
     if req.mode == "multimodal" and mm_rag_chain:
         active_chain = mm_rag_chain
+        logger.info(f"使用多模态链路 (mode={req.mode})")
     else:
         active_chain = rag_chain
+        logger.info(f"使用纯文本链路 (mode={req.mode}, mm_chain={'有' if mm_rag_chain else '无'})")
 
     # 处理上传的文档文件 → 提取文本作为上下文
     file_context = None
@@ -99,11 +101,14 @@ async def chat(req: ChatRequest):
             file_context = "\n\n".join(file_texts)
 
     if req.stream:
-        # 流式返回
+        # 流式返回 — chat(stream=True) 返回 (generator, docs, query_type)
+        result = active_chain.chat(req.query, session_id, stream=True, images=req.images, file_context=file_context)
+        stream_gen = result[0] if isinstance(result, tuple) else result
+
         async def generate():
-            for chunk in active_chain.chat(req.query, session_id, stream=True, images=req.images, file_context=file_context):
+            for chunk in stream_gen:
                 yield chunk
-        
+
         return StreamingResponse(generate(), media_type="text/plain")
     
     # 非流式

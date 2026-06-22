@@ -221,7 +221,13 @@ class VectorRetriever:
                         "score": float(scores[idx]),
                         "source_type": "keyword"
                     })
-            
+
+            # 调试日志
+            for i, r in enumerate(results):
+                logger.info(
+                    f"  BM25[{i+1}] 来源={r['source']}, 页码={r['page_number']}, "
+                    f"bm25_score={r['score']:.4f}"
+                )
             return results
         except Exception as e:
             logger.warning(f"BM25 检索失败: {e}")
@@ -245,11 +251,12 @@ class VectorRetriever:
         )
         
         docs = []
-        for hit in results[0]:
+        hits = results[0] if results else []
+        for hit in hits:
             entity = hit.get("entity", {})
             # COSINE metric: distance = 1 - cosine_similarity
             # 转换为 similarity = 1 - distance，值域 [-1, 1]，越大越相似
-            distance = hit.get("distance", 1.0)
+            distance = hit.get("distance", 0.0)
             similarity = 1.0 - distance
             docs.append({
                 "content": entity.get("content"),
@@ -260,7 +267,13 @@ class VectorRetriever:
                 "score": similarity,
                 "source_type": "vector"
             })
-        
+
+        # 调试日志
+        for i, d in enumerate(docs):
+            logger.info(
+                f"  向量[{i+1}] 来源={d['source']}, 页码={d['page_number']}, "
+                f"cosine_sim={d['score']:.4f}"
+            )
         return docs
     
     def _rrf_fusion(self, vector_results: List[Dict], keyword_results: List[Dict], k: int = None) -> List[Dict]:
@@ -307,12 +320,13 @@ class VectorRetriever:
             检索结果列表（已过滤低于阈值的结果）
         """
         top_k = top_k or settings.top_k
+        candidate_k = top_k * 3  # 扩大候选池
         
         # 1. 向量检索
-        vector_results = self._vector_search(query, top_k=top_k)
+        vector_results = self._vector_search(query, top_k=candidate_k)
         
         # 2. BM25 关键词检索
-        keyword_results = self._bm25_search(query, top_k=top_k)
+        keyword_results = self._bm25_search(query, top_k=candidate_k)
         
         # 3. RRF 融合排序
         if keyword_results:
@@ -333,6 +347,14 @@ class VectorRetriever:
         
         results = fused_results[:top_k]
         logger.info(f"检索完成: 向量={len(vector_results)}, 关键词={len(keyword_results)}, 最终={len(results)}")
+        # 调试日志：打印最终结果详情
+        for i, r in enumerate(results):
+            logger.info(
+                f"  [{i+1}] 来源={r.get('source', '?')}, "
+                f"页码={r.get('page_number', 0)}, "
+                f"分数={r.get('score', 0):.4f}, "
+                f"类型={r.get('source_type', '?')}"
+            )
         return results
     
     def delete_by_doc_id(self, doc_id: str) -> int:
@@ -721,15 +743,26 @@ class MultimodalRetriever:
         return f"[图片] 来源: {source}, 第{page}页"
 
     def search(self, query: str, top_k: int = None) -> List[Dict]:
-        """多模态混合检索（与 VectorRetriever.search 接口一致）"""
-        top_k = top_k or settings.top_k
+        """多模态纯向量检索
 
-        # 1. 向量检索（用多模态模型编码查询）
+        策略：仅使用 Qwen3-VL 多模态 embedding 做语义相似度检索。
+        不使用 BM25，原因：
+        1. 多模态 collection 含大量图片描述文本，BM25 关键词匹配效果极差
+        2. BM25 在 langchain 截图描述中匹配到无关高频词，产生大量噪音
+        3. Qwen3-VL 4096d embedding 已能准确理解文本+图片语义
+
+        去重策略：同一来源文件只保留分数最高的 1 条，避免单文件霸榜。
+        """
+        top_k = top_k or settings.top_k
+        # 扩大候选池再做去重，保证去重后仍有足够结果
+        candidate_k = max(top_k * 10, 50)
+
+        # 向量检索（用多模态模型编码查询）
         query_vector = self.embedder.embed_text(query)
         results = self._client.search(
             self.collection_name,
             data=[query_vector],
-            limit=top_k,
+            limit=candidate_k,
             output_fields=[
                 "content", "filename", "chunk_id",
                 "chunk_index", "page_number", "has_image", "image_url"
@@ -737,14 +770,13 @@ class MultimodalRetriever:
             search_params={"metric_type": "COSINE"},
         )
 
-        vector_docs = []
-        for hit in results[0]:
+        all_docs = []
+        hits = results[0] if results else []
+        for hit in hits:
             entity = hit.get("entity", {})
-            # COSINE metric: distance = 1 - cosine_similarity
-            # 转换为 similarity = 1 - distance，值域 [-1, 1]，越大越相似
-            distance = hit.get("distance", 1.0)
+            distance = hit.get("distance", 0.0)
             similarity = 1.0 - distance
-            vector_docs.append({
+            all_docs.append({
                 "content": entity.get("content"),
                 "source": entity.get("filename", "未知"),
                 "chunk_id": entity.get("chunk_id", ""),
@@ -756,62 +788,30 @@ class MultimodalRetriever:
                 "source_type": "vector"
             })
 
-        # 2. BM25（仅文本部分）
-        keyword_docs = []
-        if self._bm25_docs:
-            try:
-                import jieba
-                import numpy as np
-                from rank_bm25 import BM25Okapi
-
-                query_tokens = list(jieba.cut(query))
-                corpus_tokens = [
-                    list(jieba.cut(d.get("content", "")))
-                    for d in self._bm25_docs
-                ]
-                bm25 = BM25Okapi(corpus_tokens)
-                scores = bm25.get_scores(query_tokens)
-                top_indices = np.argsort(scores)[::-1][:top_k]
-
-                for idx in top_indices:
-                    if scores[idx] > 0:
-                        keyword_docs.append({
-                            "content": self._bm25_docs[idx].get("content", ""),
-                            "source": self._bm25_docs[idx].get("filename", "未知"),
-                            "chunk_id": self._bm25_docs[idx].get("chunk_id", ""),
-                            "page_number": self._bm25_docs[idx].get("page_number", 0),
-                            "has_image": self._bm25_docs[idx].get("has_image", False),
-                            "image_url": self._bm25_docs[idx].get("image_url", ""),
-                            "score": float(scores[idx]),
-                            "source_type": "keyword"
-                        })
-            except Exception as e:
-                logger.warning(f"多模态 BM25 检索失败: {e}")
-
-        # 3. RRF 融合
-        if keyword_docs:
-            fused_results = self._rrf_fusion(vector_docs, keyword_docs)
-        else:
-            fused_results = vector_docs
-
-        # 4. RRF 融合分数阈值过滤
-        rrf_threshold = settings.rrf_threshold
-        before = len(fused_results)
-        if rrf_threshold > 0:
-            fused_results = [r for r in fused_results if r.get("score", 0) >= rrf_threshold]
-            if len(fused_results) < before:
-                logger.info(
-                    f"多模态 RRF 阈值过滤: {before} → {len(fused_results)} 条 "
-                    f"(rrf_threshold={rrf_threshold})"
-                )
-
-        results_final = fused_results[:top_k]
+        # 文件来源去重：同一文件只保留分数最高的 1 条
+        seen_files: set[str] = set()
+        vector_docs = []
+        for doc in all_docs:
+            fname = doc["source"]
+            if fname not in seen_files:
+                seen_files.add(fname)
+                vector_docs.append(doc)
+            if len(vector_docs) >= top_k:
+                break
 
         logger.info(
-            f"多模态检索完成: 向量={len(vector_docs)}, "
-            f"关键词={len(keyword_docs)}, 最终={len(results_final)}"
+            f"多模态检索完成: 候选={len(all_docs)}, "
+            f"去重丢弃={len(all_docs) - len(vector_docs)}, "
+            f"最终={len(vector_docs)}"
         )
-        return results_final
+        for i, r in enumerate(vector_docs):
+            logger.info(
+                f"  [{i+1}] 来源={r.get('source', '?')}, "
+                f"页码={r.get('page_number', 0)}, "
+                f"cosine={r.get('score', 0):.4f}, "
+                f"has_image={r.get('has_image', False)}"
+            )
+        return vector_docs
 
     @staticmethod
     def _rrf_fusion(
