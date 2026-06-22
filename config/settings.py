@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     # ========== 检索配置 ==========
     retriever_top_k: int = 5
     similarity_threshold: float = 0.3
+    rrf_threshold: float = 0.015  # RRF 融合分数阈值，低于此值的结果被过滤
     max_context_tokens: int = 3000  # 上下文最大 token 数
     rrf_k: int = 60  # RRF (Reciprocal Rank Fusion) 参数
     

@@ -311,28 +311,27 @@ class VectorRetriever:
         # 1. 向量检索
         vector_results = self._vector_search(query, top_k=top_k)
         
-        # 2. 相似度阈值过滤（在 RRF 融合前，基于余弦相似度过滤）
-        #    score 已在 _vector_search 中转换为 similarity（越大越相似）
-        threshold = settings.similarity_threshold
-        if threshold > 0 and vector_results:
-            before = len(vector_results)
-            vector_results = [r for r in vector_results if r.get("score", 0) >= threshold]
-            if len(vector_results) < before:
-                logger.info(
-                    f"向量阈值过滤: {before} → {len(vector_results)} 条 "
-                    f"(similarity阈值={threshold})"
-                )
-        
-        # 3. BM25 关键词检索
+        # 2. BM25 关键词检索
         keyword_results = self._bm25_search(query, top_k=top_k)
         
-        # 4. RRF 融合排序
+        # 3. RRF 融合排序
         if keyword_results:
             fused_results = self._rrf_fusion(vector_results, keyword_results)
-            results = fused_results[:top_k]
         else:
-            results = vector_results[:top_k]
+            fused_results = vector_results
         
+        # 4. RRF 融合分数阈值过滤
+        rrf_threshold = settings.rrf_threshold
+        before = len(fused_results)
+        if rrf_threshold > 0:
+            fused_results = [r for r in fused_results if r.get("score", 0) >= rrf_threshold]
+            if len(fused_results) < before:
+                logger.info(
+                    f"RRF 阈值过滤: {before} → {len(fused_results)} 条 "
+                    f"(rrf_threshold={rrf_threshold})"
+                )
+        
+        results = fused_results[:top_k]
         logger.info(f"检索完成: 向量={len(vector_results)}, 关键词={len(keyword_results)}, 最终={len(results)}")
         return results
     
@@ -416,7 +415,7 @@ class MultimodalRetriever:
                 batch = self._client.query(
                     self.collection_name,
                     filter='chunk_id != ""',
-                    output_fields=["content", "filename", "chunk_id", "page_number"],
+                    output_fields=["content", "filename", "chunk_id", "page_number", "has_image", "image_url"],
                     limit=batch_size,
                     offset=offset
                 )
@@ -757,18 +756,6 @@ class MultimodalRetriever:
                 "source_type": "vector"
             })
 
-        # 1.5 向量阈值过滤（在 RRF 融合前，基于余弦相似度过滤）
-        #    score 已转换为 similarity（越大越相似）
-        threshold = settings.similarity_threshold
-        if threshold > 0 and vector_docs:
-            before = len(vector_docs)
-            vector_docs = [r for r in vector_docs if r.get("score", 0) >= threshold]
-            if len(vector_docs) < before:
-                logger.info(
-                    f"多模态向量阈值过滤: {before} → {len(vector_docs)} 条 "
-                    f"(similarity阈值={threshold})"
-                )
-
         # 2. BM25（仅文本部分）
         keyword_docs = []
         if self._bm25_docs:
@@ -793,6 +780,8 @@ class MultimodalRetriever:
                             "source": self._bm25_docs[idx].get("filename", "未知"),
                             "chunk_id": self._bm25_docs[idx].get("chunk_id", ""),
                             "page_number": self._bm25_docs[idx].get("page_number", 0),
+                            "has_image": self._bm25_docs[idx].get("has_image", False),
+                            "image_url": self._bm25_docs[idx].get("image_url", ""),
                             "score": float(scores[idx]),
                             "source_type": "keyword"
                         })
@@ -801,9 +790,22 @@ class MultimodalRetriever:
 
         # 3. RRF 融合
         if keyword_docs:
-            results_final = self._rrf_fusion(vector_docs, keyword_docs)[:top_k]
+            fused_results = self._rrf_fusion(vector_docs, keyword_docs)
         else:
-            results_final = vector_docs[:top_k]
+            fused_results = vector_docs
+
+        # 4. RRF 融合分数阈值过滤
+        rrf_threshold = settings.rrf_threshold
+        before = len(fused_results)
+        if rrf_threshold > 0:
+            fused_results = [r for r in fused_results if r.get("score", 0) >= rrf_threshold]
+            if len(fused_results) < before:
+                logger.info(
+                    f"多模态 RRF 阈值过滤: {before} → {len(fused_results)} 条 "
+                    f"(rrf_threshold={rrf_threshold})"
+                )
+
+        results_final = fused_results[:top_k]
 
         logger.info(
             f"多模态检索完成: 向量={len(vector_docs)}, "
