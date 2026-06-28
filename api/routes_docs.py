@@ -150,6 +150,9 @@ async def upload_document(file: UploadFile = File(...)):
 @router.post("/upload/batch", response_model=BatchUploadResponse)
 async def upload_documents_batch(files: List[UploadFile] = File(...)):
     """批量上传文档并入库"""
+    # P2-12: 批量上传文件数量限制
+    if len(files) > 20:
+        raise HTTPException(status_code=400, detail=f"单次最多上传 20 个文件，当前 {len(files)} 个")
     if not retriever or not chunker:
         raise HTTPException(status_code=503, detail="服务未初始化")
 
@@ -292,12 +295,18 @@ async def delete_document(filename: str):
             except Exception as e:
                 logger.warning(f"多模态删除失败: {e}")
 
-        # 2. 删除原始文件（模糊匹配，因为文件名可能带 uuid 前缀）
+        # 2. 删除原始文件（精确匹配 uuid 前缀后的原始文件名）
         deleted_files = []
         if os.path.isdir(settings.upload_dir):
             for f in os.listdir(settings.upload_dir):
-                # 文件名格式: {uuid}_{原始文件名}
-                if f.endswith(filename) or f == filename:
+                # 文件名格式: {uuid}_{原始文件名}，去掉 uuid 前缀后精确比较
+                stripped = f
+                if "_" in f:
+                    # uuid 格式: 8-4-4-4-12，前缀是 uuid + "_"
+                    parts = f.split("_", 1)
+                    if len(parts) == 2 and len(parts[0]) >= 8:
+                        stripped = parts[1]
+                if stripped == filename or f == filename:
                     fpath = os.path.join(settings.upload_dir, f)
                     os.remove(fpath)
                     deleted_files.append(f)

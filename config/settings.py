@@ -19,8 +19,8 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 2048
     llm_timeout: float = 120.0
     
-    # ========== 多模态 LLM 配置（mimo-v2-omni） ==========
-    mm_llm_model_name: str = "mimo-v2-omni"
+    # ========== 多模态 LLM 配置 ==========
+    mm_llm_model_name: str = "mimo-v2.5"
     
     # ========== Embedding 配置 ==========
     embedding_api_key: str = ""
@@ -39,10 +39,10 @@ class Settings(BaseSettings):
     
     # ========== 检索配置 ==========
     retriever_top_k: int = 5
-    similarity_threshold: float = 0.3
-    rrf_threshold: float = 0.015  # RRF 融合分数阈值，低于此值的结果被过滤
+    similarity_threshold: float = 0.5
+    rrf_threshold: float = 0.005  # RRF 融合分数阈值，低于此值的结果被过滤
     max_context_tokens: int = 3000  # 上下文最大 token 数
-    rrf_k: int = 60  # RRF (Reciprocal Rank Fusion) 参数
+    rrf_k: int = 20  # RRF (Reciprocal Rank Fusion) 参数，小规模知识库用 20 区分度更好
     
     # ========== 对话记忆配置 ==========
     max_history_rounds: int = 10

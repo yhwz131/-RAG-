@@ -11,7 +11,7 @@
 4. 如果脚本报错（API Key 缺失、超时等），告知用户具体原因
 
 > **为什么**：当前基座模型（mimo-v2.5）不支持多模态输入，无法直接理解图片。
-> 必须通过 mimo-v2-omni 模型（同 API 端点，模型名不同）来处理图片。
+> 必须通过 mimo-v2.5 模型（同 API 端点，模型名不同）来处理图片。
 > 技能详情参见 `.github/skills/multimodal-image/SKILL.md`
 
 ## 通用规则
@@ -23,7 +23,7 @@
 ## 技术栈
 - 后端：FastAPI + Milvus Lite + PySpark 4.1.2
 - 前端：Vue 3 + TypeScript + Element Plus + Vite
-- LLM：mimo-v2.5（文本）+ mimo-v2-omni（多模态，同 API 端点，仅模型名不同）
+- LLM：mimo-v2.5（文本+多模态，同 API 端点）
 - Embedding：bge-large-zh-v1.5（1024 维）+ Qwen3-VL（4096 维多模态）
 - Java：OpenJDK 17.0.2（路径 /opt/jdk-17.0.2）
 

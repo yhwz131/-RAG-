@@ -12,6 +12,7 @@ from typing import List, Optional, Dict, Any
 from config.settings import settings
 from utils.logger import get_logger
 from api.pipeline.service import pipeline_service
+from api.routes_chat import invalidate_schema_cache
 
 logger = get_logger("routes_pipeline")
 
@@ -156,17 +157,18 @@ async def process_files(
 
         # 处理成功后将 staging 中所有文件移到 raw（标记为已处理）
         if result.success:
+            loop = asyncio.get_running_loop()
             for p in saved_paths:
                 if os.path.exists(p):
                     fname = os.path.basename(p)
                     dest = os.path.join(settings.upload_dir, fname)
-                    shutil.move(p, dest)
+                    await loop.run_in_executor(None, shutil.move, p, dest)
             # 同时清理 staging 中可能残留的历史文件
             for leftover in os.listdir(staging_dir):
                 leftover_path = os.path.join(staging_dir, leftover)
                 if os.path.isfile(leftover_path):
                     dest = os.path.join(settings.upload_dir, leftover)
-                    shutil.move(leftover_path, dest)
+                    await loop.run_in_executor(None, shutil.move, leftover_path, dest)
                     logger.info(f"清理残留文件: {leftover}")
             logger.info(f"已将文件从 staging 移至 raw，staging 已清空")
             pipeline_service.update_task(
@@ -309,6 +311,8 @@ async def save_database_config(config: DatabaseConfigRequest):
     """保存数据库配置到 .env 文件并重建数据源"""
     try:
         result = pipeline_service.save_db_config(config.model_dump())
+        # 数据库配置变更，清除 schema 缓存
+        invalidate_schema_cache()
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"保存配置失败: {e}")

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================
-#  知识问答系统 启动脚本 v3.0
+#  知识问答系统 启动脚本 v3.1
 #  用法: ./start.sh <command> [options]
 #
 #  命令:
@@ -230,7 +230,7 @@ do_start() {
     fi
 
     # 创建数据目录
-    mkdir -p data/uploads data/processed data/raw/images data/sessions logs
+    mkdir -p data/raw data/raw/images data/processed data/staging data/sessions data/milvus.db logs
 
     # 安装 Python 依赖
     if [ "$INSTALL_DEPS" = true ]; then
@@ -498,5 +498,5 @@ case "$COMMAND" in
     stop)    do_stop    ;;
     restart) do_restart ;;
     status)  do_status  ;;
-    logs)    do_logs "$@" ;;
+    logs)    shift; do_logs "$@" ;;
 esac

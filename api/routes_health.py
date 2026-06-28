@@ -21,7 +21,7 @@ async def health_check():
     return {
         "status": "ok",
         "uptime_seconds": round(uptime, 2),
-        "version": "1.0.0"
+        "version": "2.0.0"
     }
 
 

@@ -5,8 +5,8 @@
 | 项目 | 内容 |
 |------|------|
 | **文档名称** | 知识问答系统架构设计文档 |
-| **版本** | v3.4 |
-| **更新日期** | 2026-06-22 |
+| **版本** | v3.5 |
+| **更新日期** | 2026-06-28 |
 | **仓库地址** | [https://github.com/yhwz131/-RAG-](https://github.com/yhwz131/-RAG-) |
 | **技术栈** | FastAPI + Vue 3 + Milvus + RAG |
 | **描述** | 基于 RAG 的多模态知识问答系统整体架构设计 |
@@ -25,7 +25,7 @@
 | 功能 | 描述 |
 |------|------|
 | **智能问答** | 基于 RAG 的上下文增强问答，支持流式输出 |
-| **查询路由** | 规则 + 启发式 + LLM 三层路由，自动区分 rag/chitchat/general 三类查询 |
+| **查询路由** | LLM-first 路由：规则匹配（零成本）→ follow-up 感知 → LLM 智能分类（含置信度），自动区分 rag/general/chitchat/database/clarification 五类查询，低置信度主动向用户确认 |
 | **文档管理** | 批量上传、解析、切片、向量化入库，文件大小校验，失败自动清理 |
 | **数据管线** | 三种处理引擎（快速/Spark 批量/MySQL 导入），前端可视化配置 MySQL，文件级去重 + 数据库替换式去重，自动入库 |
 | **多模态检索** | 纯文本链路 (bge-large-zh) + 多模态链路 (Qwen3-VL-Embedding) |
@@ -157,7 +157,7 @@
 | **bge-large-zh-v1.5** | 文本 Embedding (1024 维) | API 调用 (SiliconFlow) |
 | **Qwen3-VL-Embedding-8B** | 多模态 Embedding (4096 维) | API 调用 / 本地部署 |
 | **mimo-v2.5** | 大语言模型（纯文本链路问答生成 + 查询路由分类） | API 调用 |
-| **mimo-v2-omni** | 多模态大语言模型（多模态链路，支持图片理解 + 图片描述生成） | API 调用（同端点，仅模型名不同） |
+| **mimo-v2.5** | 多模态大语言模型（多模态链路，支持图片理解 + 图片描述生成） | API 调用（同端点，仅模型名不同） |
 
 ---
 
@@ -189,7 +189,7 @@ knowledge-qa-system/
 ├── rag/                            # RAG 核心模块
 │   ├── __init__.py
 │   ├── chain.py                    # RAG 链：查询路由 → 检索 → 上下文构建 → LLM 生成
-│   ├── router.py                   # 查询路由器（规则 + LLM 混合路由，区分 rag/chitchat/general）
+│   ├── router.py                   # 查询路由器（LLM-first 路由，规则→follow-up→LLM 分类+置信度）│
 │   ├── retriever.py                # 向量检索器（Milvus + BM25 + RRF 混合检索）
 │   ├── memory.py                   # 对话记忆管理（轮次 + token 双重截断，会话持久化）
 │   └── prompt_template.py          # Prompt 模板（纯文本/多模态/闲聊/通用，含 estimate_tokens）
@@ -272,20 +272,23 @@ knowledge-qa-system/
                           ▼
 ┌─────────────────────────────────────────────────────────┐
 │ 2. 查询路由 (router.py)                                  │
-│    - 第一层：规则匹配（正则，零成本 <1ms）                │
-│    - 第 1.5 层：启发式分类（通用常识模式 + 知识库关键词） │
-│    - 第二层：LLM 分类（mimo-v2.5，few-shot 示例）       │
-│    - 返回 QueryType: rag / chitchat / general            │
-│    - 兜底：LLM 分类失败默认走 rag                        │
+│    - 第一层：规则匹配（正则问候/闲聊，零成本 <1ms）       │
+│    - 第 1.5 层：Follow-up 感知（追问沿用上轮路由）        │
+│    - 第二层：LLM 智能分类（mimo-v2.5，JSON + 置信度）    │
+│    - 返回 QueryType + confidence + reason                │
+│    - 类型: rag / chitchat / general / database / clarification │
+│    - database 仅在 MySQL 连接可用时作为选项               │
+│    - 低置信度 (<0.7) 自动走 clarification 向用户确认      │
 └─────────────────────────┬───────────────────────────────┘
                           │
-            ┌──────────────┼──────────────┐
-            ▼              ▼              ▼
-        chitchat       general          rag
-            │              │              │
-            ▼              ▼              ▼
-     直接 LLM 回答   直接 LLM 回答   继续步骤 3
-     (跳过检索)      (跳过检索)
+         ┌────────┬───────┼───────┬────────┐
+         ▼        ▼       ▼       ▼        ▼
+     chitchat  general   rag   database  clarification
+         │        │       │       │        │
+         ▼        ▼       ▼       ▼        ▼
+     直接 LLM   直接 LLM  继续    Text-to-SQL  向用户
+     回答       回答     步骤 3   路径       确认意图
+     (跳过检索) (跳过检索)
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────┐
@@ -295,7 +298,7 @@ knowledge-qa-system/
 │    - 向量检索: Milvus COSINE 相似度搜索 (top_k)         │
 │    - 关键词检索: BM25 文本匹配（jieba 分词）             │
 │    - RRF 融合: score(d) = Σ 1/(k+rank_i(d)+1)          │
-│    - 相似度阈值过滤: score < 0.3 丢弃                   │
+│    - 相似度阈值过滤: score < 0.5 丢弃                   │
 │    - 多模态链路: 同时检索 knowledge_base_mm              │
 └─────────────────────────┬───────────────────────────────┘
                           │
@@ -323,7 +326,7 @@ knowledge-qa-system/
 │      · 通用: GENERAL_SYSTEM_PROMPT                       │
 │    - 历史对话（轮次 + token 双重截断）+ 当前问题         │
 │    - 纯文本链路: 调用 mimo-v2.5 API                      │
-│    - 多模态链路: 调用 mimo-v2-omni API（支持图片）       │
+│    - 多模态链路: 调用 mimo-v2.5 API（支持图片）       │
 │    - 支持同步/流式                                       │
 └─────────────────────────┬───────────────────────────────┘
                           │
@@ -339,7 +342,7 @@ knowledge-qa-system/
 
 ### 4.2 查询路由架构
 
-路由采用三层渐进式分类，兼顾速度和准确率：
+路由采用 **LLM-first** 架构，以 LLM 分类为主力，规则匹配仅拦截明确的问候/闲聊：
 
 ```
 用户 Query
@@ -349,29 +352,60 @@ knowledge-qa-system/
 │ 第一层：规则匹配（<1ms，零成本）                         │
 │    - GREETING_PATTERNS: 问候语（你好/在吗/谢谢 等）      │
 │    - SMALL_TALK_PATTERNS: 闲聊（心情/天气/早晚安 等）    │
-│    - 命中 → chitchat，未命中 → 下一层                    │
+│    - 命中 → chitchat (confidence=1.0)，未命中 → 下一层   │
 └─────────────────────────┬───────────────────────────────┘
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────┐
-│ 第 1.5 层：启发式分类（<1ms，零成本）                    │
-│    - GENERAL_PATTERNS: 通用常识模式                      │
-│      · "如何/怎么 学习/入门/精通..."                     │
-│      · "什么是/什么叫 ..."                               │
-│    - KB_KEYWORDS: 知识库关键词检测                       │
-│      · 出现"知识库/文档/项目/系统/架构/论文"等 → 交 LLM  │
-│    - 无知识库关键词 + 匹配通用模式 → general             │
-│    - 有知识库关键词或未匹配 → 下一层                     │
+│ 第 1.5 层：Follow-up 感知（<1ms，零成本）                │
+│    - FOLLOWUP_PATTERNS: 追问指代（那/详细/为什么/呢 等） │
+│    - 命中 → 沿用上一轮的路由结果                         │
+│    - 未命中 → 下一层                                     │
 └─────────────────────────┬───────────────────────────────┘
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────┐
-│ 第二层：LLM 分类（~1s，mimo-v2.5）                      │
-│    - few-shot 示例（rag/chitchat/general 各 2-3 个）    │
-│    - 解析策略: 精确匹配 → 去前缀 → 关键词匹配           │
-│    - 兜底: 分类失败默认 rag                              │
+│ 第二层：LLM 智能分类（~2-5s，mimo-v2.5）                │
+│                                                          │
+│    提示词由 _build_classify_prompt() 动态生成：          │
+│    - 根据数据库可用性自动增减 database 类型              │
+│    - 明确列出知识库已有文档内容，辅助判断 rag vs general │
+│                                                          │
+│    输出格式：{"query_type":"类型","confidence":0.8,"reason":"理由"}│
+│    - 推理模型优先从 reasoning_content 提取结论           │
+│    - 解析策略: JSON 精确匹配 → reasoning 提取 → 关键词兜底│
+│    - 兜底: 分类失败默认 rag (confidence=0.5)             │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│ 置信度判断                                               │
+│    - confidence >= 0.7 → 按分类结果路由                  │
+│    - confidence < 0.7 且非规则匹配 → clarification       │
+│    - clarification → LLM 生成友好确认问题，向用户反问    │
 └─────────────────────────┘
 ```
+
+**五种路由类型：**
+
+| 类型 | 触发条件 | 处理方式 |
+|------|----------|----------|
+| `rag` | 查询涉及知识库已有文档内容（LangChain、大纲等） | 向量检索 + BM25 + LLM 生成 |
+| `general` | 通用知识 / 问本项目架构功能（KB 中无相关文档） | 直接 LLM 回答 |
+| `chitchat` | 规则匹配的问候/闲聊 | 直接 LLM 回答 |
+| `database` | 需要统计/排名/SQL 查询（**仅 MySQL 可用时**出现） | Text-to-SQL 路径 |
+| `clarification` | 查询太短/模糊/低置信度 | LLM 生成确认问题，向用户反问 |
+
+**数据库可用性检查：**
+- `is_database_available()` 检查 `settings.db_type` 配置 + 实际连接测试
+- 结果缓存 60 秒，避免每次路由都尝试连接 MySQL
+- 数据库不可用时，动态提示词自动排除 `database` 类型
+- 配置变更时通过 `invalidate_db_cache()` 清除缓存
+
+**枚举型查询兜底（chain.py）：**
+- `_is_enum_query()` 检测"有哪些文件/都包括什么/列举"等模式
+- 匹配时跳过向量检索，直接调用 `list_all_files()` 返回完整文件列表
+- 在 rag 和 database 路由中均生效
 
 ### 4.3 双链路检索架构
 
@@ -404,7 +438,7 @@ knowledge-qa-system/
 
 图片入库时通过 LLM Vision API 生成内容描述，存储为 `content` 字段，使 BM25 可通过文本匹配检索图片。生成流程包含：
 
-1. **描述生成**：调用 mimo-v2-omni 的 vision 能力，prompt 要求 50 字以内简要描述
+1. **描述生成**：调用 mimo-v2.5 的 vision 能力，prompt 要求 50 字以内简要描述
 2. **失败关键词检测**：比对 14 个中英文关键词（无法看到、抱歉、cannot see 等），过滤 LLM 返回的无效描述
 3. **自动重试**：检测到无效描述时自动重试，最多 3 次尝试（利用 LLM 随机性可能给出不同回答）
 4. **最终降级**：全部失败后使用默认标签 `[图片] 来源: xxx, 第x页`
@@ -455,7 +489,7 @@ knowledge-qa-system/
 │    - 纯文本链路: embedder → knowledge_base│
 │    - 多模态链路: embedder → knowledge_base_mm│
 │    - 文档图片: extract_images → mm 链路  │
-│    - 图片描述: mimo-v2-omni vision 生成    │
+│    - 图片描述: mimo-v2.5 vision 生成    │
 │    - 描述验证: 失败关键词检测 + 自动重试  │
 │    - chunk_id 去重: 防止重复入库         │
 └─────────────────────────────────────────┘
@@ -468,9 +502,17 @@ knowledge-qa-system/
         │
         ▼
 ┌─────────────────────────────────────────┐
+│ 0. 数据库可用性检查（router.py）         │
+│    - is_database_available() 检查配置+连接│
+│    - 不可用时 database 不在 LLM 选项中   │
+│    - 缓存 60 秒，配置变更时主动刷新      │
+└─────────────────┬───────────────────────┘
+                  │ (仅 DB 可用时)
+                  ▼
+┌─────────────────────────────────────────┐
 │ 1. 查询路由（router.py）                │
-│    - 规则匹配 → 数据库关键词检测        │
 │    - LLM 分类 → database 类型           │
+│    - 枚举型查询优先拦截（chain.py）      │
 └─────────────────┬───────────────────────┘
                   │
                   ▼
@@ -507,7 +549,8 @@ knowledge-qa-system/
 - **不入库**：数据库结构化数据直接用 SQL 查询，不再向量化导入 Milvus
 - **安全校验**：`validate_sql()` 只允许 SELECT，拦截 INSERT/DELETE/DROP 等危险操作
 - **两轮 LLM**：第一轮生成 SQL，第二轮总结回答，各司其职
-- **路由优先级**：数据库关键词匹配优先于通用常识启发式，避免被误分类为 general
+- **动态启用**：database 路由仅在 MySQL 连接可用时出现，避免无效分类
+- **连接检查**：`is_database_available()` 缓存 60 秒，配置变更时 `invalidate_db_cache()` 主动刷新
 
 ---
 
@@ -539,7 +582,7 @@ knowledge-qa-system/
 }
 ```
 
-- **图片**：以 base64 发送给多模态模型（mimo-v2-omni），用于图文理解
+- **图片**：以 base64 发送给多模态模型（mimo-v2.5），用于图文理解
 - **文档**：后端解码后通过 `file_parser` 提取文本，拼接到查询上下文中
 - 支持格式：图片（JPEG/PNG/GIF/WebP）、文档（PDF/Word/PPT/Excel/TXT/MD/CSV）
 
@@ -594,8 +637,8 @@ knowledge-qa-system/
 ...
 ```
 
-- `query_type` 标识查询路由结果：`rag`（知识库检索）、`chitchat`（闲聊）、`general`（通用知识）
-- `sources` 仅在 `rag` 类型下有值，`chitchat`/`general` 类型为空数组
+- `query_type` 标识查询路由结果：`rag`（知识库检索）、`chitchat`（闲聊）、`general`（通用知识）、`database`（数据库查询）、`clarification`（意图澄清）
+- `sources` 仅在 `rag` 类型下有值，`chitchat`/`general`/`clarification` 类型为空数组；`database` 类型返回 SQL 信息
 - 前端通过 `fetch` + `ReadableStream` 解析，先提取 `[SOURCES]` 中的 JSON，再逐 chunk 渲染 Markdown
 
 ---
@@ -623,7 +666,7 @@ MULTIMODAL_COLLECTION_NAME=knowledge_base_mm
 # ========== Milvus ==========
 COLLECTION_NAME=knowledge_base
 RETRIEVER_TOP_K=5
-SIMILARITY_THRESHOLD=0.3
+SIMILARITY_THRESHOLD=0.5
 
 # ========== RAG 参数 ==========
 MAX_CONTEXT_TOKENS=3000     # 上下文最大 token 数
@@ -633,7 +676,7 @@ RRF_K=60                    # RRF 融合参数
 LLM_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
 LLM_API_KEY=your-api-key-here
 LLM_MODEL_NAME=mimo-v2.5
-MM_LLM_MODEL_NAME=mimo-v2-omni
+MM_LLM_MODEL_NAME=mimo-v2.5
 LLM_TEMPERATURE=0.7
 LLM_MAX_TOKENS=2048
 LLM_TIMEOUT=120.0
@@ -840,6 +883,9 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000
 | 多模态入库失败 | 不影响纯文本链路 |
 | 图片描述生成失败 | 自动重试（最多 3 次），失败关键词检测（14 个中英文关键词），最终降级为默认标签 `[图片] 来源: xxx, 第x页`；已有历史记录可通过 `POST /api/docs/refresh-descriptions` 批量刷新 |
 | 批量上传部分失败 | 返回成功/失败详情 |
+| 查询路由分类失败 | 回退 rag (confidence=0.5)，走知识库检索 |
+| 低置信度查询 (<0.7) | 自动走 clarification，LLM 生成确认问题向用户反问 |
+| 数据库连接不可用 | database 类型自动从路由选项中排除 |
 
 ---
 

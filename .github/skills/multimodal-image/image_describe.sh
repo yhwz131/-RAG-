@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# image_describe.sh — 调用 mimo-v2-omni 多模态模型分析图片
+# image_describe.sh — 调用 mimo-v2.5 多模态模型分析图片
 #
 # 用法:
 #   bash image_describe.sh <图片路径> [用户问题]
@@ -9,7 +9,7 @@
 # 环境变量（需提前 source .env 或手动设置）:
 #   LLM_API_KEY      — API 密钥（必需）
 #   LLM_BASE_URL      — API 端点（可选，默认 https://token-plan-cn.xiaomimimo.com/v1）
-#   MM_LLM_MODEL      — 模型名（可选，默认 mimo-v2-omni）
+#   MM_LLM_MODEL      — 模型名（可选，默认 mimo-v2.5）
 # ============================================================
 
 set -euo pipefail
@@ -57,7 +57,7 @@ fi
 
 # 默认值
 LLM_BASE_URL="${LLM_BASE_URL:-https://token-plan-cn.xiaomimimo.com/v1}"
-MM_LLM_MODEL="${MM_LLM_MODEL:-mimo-v2-omni}"
+MM_LLM_MODEL="${MM_LLM_MODEL:-mimo-v2.5}"
 
 # 检查 API Key
 if [[ -z "${LLM_API_KEY:-}" ]]; then

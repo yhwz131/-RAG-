@@ -44,18 +44,39 @@ class EmbeddingClient:
         self.base_url = settings.embedding_base_url.rstrip("/")
         self.model = settings.embedding_model_name
         self.dimension = settings.embedding_dimension
-    
+        self._client = httpx.Client(
+            timeout=60,
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30,
+            ),
+        )
+
+    def close(self):
+        """关闭底层 httpx 连接池，释放 socket 资源"""
+        if self._client and not self._client.is_closed:
+            self._client.close()
+            logger.info("EmbeddingClient httpx 连接池已关闭")
+
     def embed_query(self, text: str) -> List[float]:
         """将单条文本转为向量"""
         return self._call_api([text])[0]
     
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """将多条文本批量转为向量"""
-        return self._call_api(texts)
+    def embed_documents(self, texts: List[str], batch_size: int = 64) -> List[List[float]]:
+        """将多条文本批量转为向量（自动分批，防止单次请求过大）"""
+        if len(texts) <= batch_size:
+            return self._call_api(texts)
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            all_embeddings.extend(self._call_api(batch))
+            logger.debug(f"Embedding 分批进度: {min(i + batch_size, len(texts))}/{len(texts)}")
+        return all_embeddings
     
     @retry_with_backoff(max_retries=3, base_delay=1.0)
     def _call_api(self, texts: List[str]) -> List[List[float]]:
-        """调用 Embedding API（带重试机制）"""
+        """调用 Embedding API（带重试机制，复用连接池）"""
         url = f"{self.base_url}/embeddings"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -66,13 +87,12 @@ class EmbeddingClient:
             "input": texts
         }
         
-        with httpx.Client(timeout=60) as client:
-            response = client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            embeddings = [item["embedding"] for item in data["data"]]
-            logger.info(f"Embedding 完成: {len(texts)} 条文本 -> {len(embeddings)} 个向量")
-            return embeddings
+        response = self._client.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        embeddings = [item["embedding"] for item in data["data"]]
+        logger.info(f"Embedding 完成: {len(texts)} 条文本 -> {len(embeddings)} 个向量")
+        return embeddings
 
 
 class MultimodalEmbedder:
@@ -87,6 +107,20 @@ class MultimodalEmbedder:
         self.base_url = settings.embedding_base_url.rstrip("/")
         self.model = settings.multimodal_embedding_model
         self.dimension = settings.multimodal_embedding_dim
+        self._client = httpx.Client(
+            timeout=60,
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30,
+            ),
+        )
+
+    def close(self):
+        """关闭底层 httpx 连接池，释放 socket 资源"""
+        if self._client and not self._client.is_closed:
+            self._client.close()
+            logger.info("MultimodalEmbedder httpx 连接池已关闭")
 
     def embed_text(self, text: str) -> List[float]:
         """纯文本向量化（使用多模态模型）"""
@@ -96,13 +130,14 @@ class MultimodalEmbedder:
         }
         return self._call_api(payload)[0]
 
-    def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        """批量纯文本向量化"""
-        payload = {
-            "model": self.model,
-            "input": [{"text": t} for t in texts]
-        }
-        return self._call_api(payload)
+    def embed_texts(self, texts: List[str], batch_size: int = 64) -> List[List[float]]:
+        """批量纯文本向量化（自动分批）"""
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            payload = {"model": self.model, "input": [{"text": t} for t in batch]}
+            all_embeddings.extend(self._call_api(payload))
+        return all_embeddings
 
     def embed_image(self, image_b64: str, description: str = "", mime_type: str = "png") -> List[float]:
         """图片向量化，可附带文字描述
@@ -130,17 +165,18 @@ class MultimodalEmbedder:
         }
         return self._call_api(payload)[0]
 
-    def embed_mixed(self, items: List[Dict]) -> List[List[float]]:
-        """批量混合向量化
+    def embed_mixed(self, items: List[Dict], batch_size: int = 64) -> List[List[float]]:
+        """批量混合向量化（自动分批）
 
         Args:
             items: [{"text": "..."}, {"image": "base64...", "text": "描述"}, ...]
         """
-        payload = {
-            "model": self.model,
-            "input": items
-        }
-        return self._call_api(payload)
+        all_embeddings = []
+        for i in range(0, len(items), batch_size):
+            batch = items[i:i + batch_size]
+            payload = {"model": self.model, "input": batch}
+            all_embeddings.extend(self._call_api(payload))
+        return all_embeddings
 
     @retry_with_backoff(max_retries=3, base_delay=1.0)
     def _call_api(self, payload: dict) -> List[List[float]]:
@@ -151,13 +187,12 @@ class MultimodalEmbedder:
             "Content-Type": "application/json"
         }
 
-        with httpx.Client(timeout=60) as client:
-            resp = client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            embeddings = [item["embedding"] for item in data["data"]]
-            logger.info(
-                f"多模态 Embedding 完成: {len(payload['input'])} 项 -> "
-                f"{len(embeddings)} 个向量, 维度={len(embeddings[0]) if embeddings else 0}"
-            )
-            return embeddings
+        resp = self._client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        embeddings = [item["embedding"] for item in data["data"]]
+        logger.info(
+            f"多模态 Embedding 完成: {len(payload['input'])} 项 -> "
+            f"{len(embeddings)} 个向量, 维度={len(embeddings[0]) if embeddings else 0}"
+        )
+        return embeddings

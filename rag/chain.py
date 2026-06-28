@@ -5,6 +5,7 @@ RAG 链模块
 database 类型走 Text-to-SQL 路径：表结构 -> LLM 生成 SQL -> 执行 -> LLM 总结
 """
 import json
+import re
 import httpx
 from typing import List, Dict, Optional
 from config.settings import settings
@@ -15,9 +16,27 @@ from rag.prompt_template import (
     SYSTEM_PROMPT, CHITCHAT_SYSTEM_PROMPT, GENERAL_SYSTEM_PROMPT,
     MULTIMODAL_SYSTEM_PROMPT, SQL_GENERATION_PROMPT, SQL_RESULT_PROMPT, estimate_tokens,
 )
-from rag.router import route_query, QueryType, preprocess_query
+from rag.router import route_query, QueryType, preprocess_query, CONFIDENCE_THRESHOLD
 
 logger = get_logger("chain")
+
+# 枚举型查询模式 — 用户想列出/盘点知识库内容，而非语义搜索
+_ENUM_PATTERNS = [
+    r'(知识库|库里|里面|系统里|文档库|资料库).*(有哪些|有什么|有些什么|有啥|都有什么|包括什么|包含什么|多少个|几个|列出|列举|清单|列表)',
+    r'(有哪些|有什么|有些什么|有啥|都有什么|包括什么|包含什么|列出|列举).*(文档|文件|资料|内容|材料)',
+    r'(所有|全部|一共|总共|合计).*(文档|文件|资料)',
+    r'(盘点|清点|整理).*(文档|文件|资料)',
+    r'(知识库|库里|里面|系统里|文档库|资料库).*(什么|啥).*(文件|文档|资料|内容)',
+]
+
+
+def _is_enum_query(query: str) -> bool:
+    """检测是否是枚举/列表型查询（想看知识库全貌）"""
+    q = query.strip().lower()
+    for pat in _ENUM_PATTERNS:
+        if re.search(pat, q):
+            return True
+    return False
 
 
 class RAGChain:
@@ -36,7 +55,28 @@ class RAGChain:
         self.llm_key = settings.llm_api_key
         self.llm_model = settings.mm_llm_model if is_multimodal else settings.llm_model
         self.timeout = settings.llm_timeout
+        self._http_client = httpx.Client(
+            timeout=self.timeout,
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30,
+            ),
+        )
+        # Text-to-SQL schema 缓存（避免每次查询都读取表结构）
+        self._schema_cache: Optional[str] = None
         logger.info(f"RAG Chain 初始化完成 (multimodal={is_multimodal}, model={self.llm_model})")
+
+    def close(self):
+        """关闭底层 httpx 连接池和检索器资源"""
+        try:
+            if self._http_client and not self._http_client.is_closed:
+                self._http_client.close()
+            if self.retriever:
+                self.retriever.close()
+            logger.info(f"RAGChain 资源已释放 (multimodal={self.is_multimodal})")
+        except Exception as e:
+            logger.warning(f"RAGChain 关闭异常: {e}")
     
     def _build_context(self, docs: List[Dict], max_context_tokens: int = 3000) -> str:
         """将检索到的文档构建为上下文字符串（带 token 长度控制）
@@ -164,37 +204,34 @@ class RAGChain:
             return self._sync_llm(headers, payload)
     
     def _sync_llm(self, headers: dict, payload: dict) -> str:
-        """同步调用 LLM"""
+        """同步调用 LLM（复用连接池）"""
         try:
-            with httpx.Client(timeout=self.timeout) as client:
-                resp = client.post(self.llm_url, json=payload, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                return data["choices"][0]["message"]["content"]
+            resp = self._http_client.post(self.llm_url, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
         except Exception as e:
             logger.error(f"LLM 调用失败: {e}")
             raise
     
     def _stream_llm(self, headers: dict, payload: dict):
-        """流式调用 LLM"""
+        """流式调用 LLM（复用连接池）"""
         try:
-            with httpx.Client(timeout=self.timeout) as client:
-                with client.stream("POST", self.llm_url, json=payload, headers=headers) as resp:
-                    resp.raise_for_status()
-                    for line in resp.iter_lines():
-                        if line.startswith("data: "):
-                            data_str = line[6:]
-                            if data_str.strip() == "[DONE]":
-                                break
-                            try:
-                                import json
-                                data = json.loads(data_str)
-                                delta = data["choices"][0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    yield content
-                            except Exception:
-                                continue
+            with self._http_client.stream("POST", self.llm_url, json=payload, headers=headers) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            delta = data["choices"][0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                yield content
+                        except Exception:
+                            continue
         except Exception as e:
             logger.error(f"LLM 流式调用失败: {e}")
             raise
@@ -206,6 +243,114 @@ class RAGChain:
         from api.pipeline.engines.database import create_database_source
         return create_database_source()
     
+    def _get_cached_schema(self, db_source) -> str:
+        """获取缓存的数据库表结构（避免每次查询都读取）"""
+        if self._schema_cache is None:
+            self._schema_cache = db_source.get_schema_for_llm()
+            logger.info(f"[Text-to-SQL] 表结构已缓存 ({len(self._schema_cache)} 字符)")
+        return self._schema_cache
+    
+    def invalidate_schema_cache(self):
+        """清除 schema 缓存（数据库配置变更时调用）"""
+        self._schema_cache = None
+        logger.info("[Text-to-SQL] schema 缓存已清除")
+    
+    def _handle_clarification(self, query: str, session_id: str,
+                               confidence: float, reason: str, stream: bool = False):
+        """澄清处理：向用户提问以明确意图
+        
+        Args:
+            query: 用户原始查询
+            session_id: 会话ID
+            confidence: 路由置信度
+            reason: 路由理由
+            stream: 是否流式输出
+        """
+        # 根据查询内容生成有针对性的澄清问题
+        clarification_prompt = f"""用户说了："{query}"
+
+这个查询意图不够明确，请用友好、简洁的方式向用户确认他们想要什么。
+给出 2-3 个选项供用户选择，例如：
+1. 搜索知识库中的相关内容
+2. 询问通用知识
+3. 其他（请说明）
+
+回复要简短自然，像真人对话一样。不要使用 markdown 格式。"""
+
+        messages = [{"role": "user", "content": clarification_prompt}]
+        self.memory.add(session_id, "user", query)
+        
+        try:
+            answer = self._call_llm(messages, stream=False)
+        except Exception as e:
+            logger.error(f"澄清 LLM 调用失败: {e}")
+            answer = (
+                "抱歉，我没有完全理解您的问题。您是想：\n"
+                "1. 搜索知识库中的相关内容？\n"
+                "2. 了解通用知识？\n"
+                "3. 还是有其他需求？\n"
+                "请告诉我您的具体需求，我会更好地帮助您。"
+            )
+        
+        self.memory.add(session_id, "assistant", answer)
+        logger.info(f"澄清处理完成: confidence={confidence:.2f}, reason={reason}")
+        
+        if stream:
+            def _clarify_gen():
+                yield answer
+            return _clarify_gen(), [], QueryType.CLARIFICATION
+        return answer, [], QueryType.CLARIFICATION
+
+    def _handle_enum_query(self, query: str, session_id: str, stream: bool = False):
+        """枚举型查询处理：直接查元数据，返回完整文件列表
+        
+        Args:
+            query: 用户查询
+            session_id: 会话ID
+            stream: 是否流式输出
+        """
+        # 从 retriever 获取文件列表（兼容 VectorRetriever.list_all_files 和 MultimodalRetriever.list_documents）
+        list_method = getattr(self.retriever, 'list_all_files', None) or getattr(self.retriever, 'list_documents', None)
+        text_files = list_method() if list_method else []
+        
+        # 合并去重
+        all_files = {f["filename"]: f["chunk_count"] for f in text_files}
+        
+        total_chunks = sum(all_files.values())
+        file_list = "\n".join(
+            f"  {i+1}. {fname}（{count} 个切片）"
+            for i, (fname, count) in enumerate(sorted(all_files.items()))
+        )
+        
+        context = (
+            f"当前知识库中共有 {len(all_files)} 个文档，{total_chunks} 个切片：\n\n"
+            f"{file_list}"
+        )
+        
+        # 构造引用列表（用于前端展示）
+        refs = [
+            {"source": fname, "content": f"共 {count} 个切片", "score": 1.0,
+             "chunk_index": 0, "page_number": 0, "has_image": False, "image_url": ""}
+            for fname, count in sorted(all_files.items())
+        ]
+        
+        # 构建消息让 LLM 用自然语言总结
+        messages = self._build_messages(query, context, session_id)
+        self.memory.add(session_id, "user", query)
+        
+        logger.info(f"枚举查询: 返回 {len(all_files)} 个文件, {total_chunks} 个切片")
+        
+        if stream:
+            return self._chat_stream(query, messages, session_id, refs, query_type=QueryType.RAG)
+        else:
+            try:
+                answer = self._call_llm(messages, stream=False)
+            except Exception as e:
+                logger.error(f"LLM 调用失败(枚举): {e}")
+                answer = context  # LLM 失败时直接返回原始列表
+            self.memory.add(session_id, "assistant", answer)
+            return answer, refs, QueryType.RAG
+
     def _handle_database_query(self, query: str, session_id: str, stream: bool = False):
         """Text-to-SQL 处理流程：表结构 -> LLM 生成 SQL -> 安全执行 -> LLM 总结
         
@@ -230,9 +375,9 @@ class RAGChain:
             return err_msg, [], QueryType.DATABASE
         
         try:
-            # 2. 获取表结构
-            schema_text = db_source.get_schema_for_llm()
-            logger.info(f"[Text-to-SQL] 表结构:\n{schema_text}")
+            # 2. 获取表结构（缓存）
+            schema_text = self._get_cached_schema(db_source)
+            logger.info(f"[Text-to-SQL] 表结构: {len(schema_text)} 字符")
             
             # 3. LLM 生成 SQL
             sql_prompt = SQL_GENERATION_PROMPT.format(
@@ -358,8 +503,6 @@ class RAGChain:
     
     def _chat_stream_database(self, query: str, sql: str, result: Dict, messages: List[Dict], session_id: str):
         """Text-to-SQL 流式输出"""
-        import json as _json
-        
         # 先 yield 元信息（SQL + 引用）
         result_preview = self._format_sql_result(result, max_rows=5)
         meta = {
@@ -374,15 +517,17 @@ class RAGChain:
                 "image_url": "",
             }]
         }
-        yield f"[SOURCES]{_json.dumps(meta, ensure_ascii=False)}[/SOURCES]\n\n"
+        yield f"[SOURCES]{json.dumps(meta, ensure_ascii=False)}[/SOURCES]\n\n"
         
         # 流式返回 LLM 回答
         full_answer = ""
-        for chunk in self._call_llm(messages, stream=True):
-            full_answer += chunk
-            yield chunk
-        
-        self.memory.add(session_id, "assistant", full_answer)
+        try:
+            for chunk in self._call_llm(messages, stream=True):
+                full_answer += chunk
+                yield chunk
+        finally:
+            if full_answer:
+                self.memory.add(session_id, "assistant", full_answer)
     
     def chat(self, query: str, session_id: str = "default", stream: bool = False, images: Optional[List[str]] = None, file_context: Optional[str] = None):
         """
@@ -400,9 +545,20 @@ class RAGChain:
         """
         logger.info(f"收到查询: session={session_id}, query={query[:100]}")
         
-        # 0. 查询路由：混合路由（规则 + LLM 分类）
-        query_type = route_query(query)
-        logger.info(f"查询路由结果: {query_type.value}")
+        # 0. 查询路由：规则 → follow-up → LLM 智能分类（返回三元组）
+        history = self.memory.get_context(session_id)
+        query_type, confidence, route_reason = route_query(query, history=history)
+        logger.info(f"查询路由结果: {query_type.value} (置信度={confidence:.2f}, {route_reason})")
+        
+        # 意图不明确：直接向用户确认，不浪费检索和 LLM 调用
+        if query_type == QueryType.CLARIFICATION:
+            logger.info(f"查询路由: clarification 类型，向用户确认意图")
+            return self._handle_clarification(query, session_id, confidence, route_reason, stream=stream)
+        
+        # 低置信度且非规则匹配：也走澄清流程
+        if confidence < CONFIDENCE_THRESHOLD and route_reason != "规则匹配":
+            logger.info(f"查询路由: 置信度 {confidence:.2f} < {CONFIDENCE_THRESHOLD}，向用户确认")
+            return self._handle_clarification(query, session_id, confidence, route_reason, stream=stream)
         
         # 闲聊/通用知识：直接走 LLM，不走 RAG 检索
         if query_type in (QueryType.CHITCHAT, QueryType.GENERAL):
@@ -412,20 +568,34 @@ class RAGChain:
             if stream:
                 return self._chat_stream(query, messages, session_id, [], query_type=query_type)
             else:
-                answer = self._call_llm(messages, stream=False)
+                try:
+                    answer = self._call_llm(messages, stream=False)
+                except Exception as e:
+                    logger.error(f"LLM 调用失败({query_type.value}): {e}")
+                    answer = "抱歉，AI 服务暂时不可用，请稍后再试。"
                 self.memory.add(session_id, "assistant", answer)
                 return answer, [], query_type
         
         # 数据库查询：走 Text-to-SQL 路径
         if query_type == QueryType.DATABASE:
+            # 枚举型查询优先：即使是 DATABASE 路由，如果查询是枚举型则直接查元数据
+            if _is_enum_query(query):
+                logger.info(f"枚举型查询检测命中(覆盖DATABASE): {query[:50]}... -> 查元数据")
+                return self._handle_enum_query(query, session_id, stream=stream)
             logger.info(f"查询路由: database 类型，走 Text-to-SQL 路径")
             return self._handle_database_query(query, session_id, stream=stream)
         
         # 1. 检索相关文档（预处理查询，仅用于检索；LLM 仍看原始 query）
         retrieval_query = preprocess_query(query)
+        
+        # 1.1 枚举型查询：直接查元数据，不走向量检索
+        if _is_enum_query(query):
+            logger.info(f"枚举型查询检测命中: {query[:50]}... -> 查元数据")
+            return self._handle_enum_query(query, session_id, stream=stream)
+        
         docs = self.retriever.search(retrieval_query)
         
-        # 1.5 硬校验：无相关文档时直接返回，不调用 LLM
+        # 1.5 硬校验：无相关文档或相关度过低时直接返回，不调用 LLM
         if not docs:
             no_ref_answer = (
                 "抱歉，知识库中没有找到与您问题相关的内容。"
@@ -438,6 +608,31 @@ class RAGChain:
                 def _empty_gen():
                     yield no_ref_answer
                 return _empty_gen(), [], query_type
+            return no_ref_answer, [], query_type
+        
+        # 相关度过滤：最高分低于阈值时，认为不相关
+        # 注意：RRF 融合分数（~0.01-0.1）和余弦相似度（~0.3-0.9）量纲不同
+        best_score = max(d.get("score", 0) for d in docs)
+        is_rrf = any(d.get("source_type") == "fusion" for d in docs)
+        if is_rrf:
+            # RRF 路径：用 rrf_threshold 的 50% 作为最低门槛
+            min_relevant_score = settings.rrf_threshold * 0.5
+        else:
+            # 纯向量路径：用 similarity_threshold 的 80%
+            min_relevant_score = settings.similarity_threshold * 0.8
+        if best_score < min_relevant_score:
+            no_ref_answer = (
+                f"抱歉，知识库中没有找到与您问题足够相关的内容"
+                f"（最高相似度 {best_score:.2f}，需 ≥ {min_relevant_score:.2f}）。"
+                f"请尝试换个问法，或上传相关文档后再提问。"
+            )
+            self.memory.add(session_id, "user", query)
+            self.memory.add(session_id, "assistant", no_ref_answer)
+            logger.info(f"知识校验: 最高相关度 {best_score:.4f} < {min_relevant_score:.4f}，返回拒答")
+            if stream:
+                def _low_gen():
+                    yield no_ref_answer
+                return _low_gen(), [], query_type
             return no_ref_answer, [], query_type
         
         # 2. 构建上下文（带 token 长度控制）
@@ -453,7 +648,11 @@ class RAGChain:
         if stream:
             return self._chat_stream(query, messages, session_id, docs, query_type=query_type)
         else:
-            answer = self._call_llm(messages, stream=False)
+            try:
+                answer = self._call_llm(messages, stream=False)
+            except Exception as e:
+                logger.error(f"LLM 调用失败(RAG): {e}")
+                answer = "抱歉，AI 服务暂时不可用，请稍后再试。"
             # 记录助手回答
             self.memory.add(session_id, "assistant", answer)
             logger.info(f"回答生成完成: {answer[:100]}")
@@ -461,7 +660,6 @@ class RAGChain:
     
     def _chat_stream(self, query: str, messages: List[Dict], session_id: str, docs: List[Dict], query_type: QueryType = QueryType.RAG):
         """流式对话，先返回引用信息，再流式返回回答"""
-        import json as _json
         # 先 yield 查询类型和引用信息
         meta = {
             "query_type": query_type.value,
@@ -478,13 +676,15 @@ class RAGChain:
                 for d in docs
             ]
         }
-        yield f"[SOURCES]{_json.dumps(meta, ensure_ascii=False)}[/SOURCES]\n\n"
+        yield f"[SOURCES]{json.dumps(meta, ensure_ascii=False)}[/SOURCES]\n\n"
         
         # 流式返回回答
         full_answer = ""
-        for chunk in self._call_llm(messages, stream=True):
-            full_answer += chunk
-            yield chunk
-        
-        # 记录完整回答
-        self.memory.add(session_id, "assistant", full_answer)
+        try:
+            for chunk in self._call_llm(messages, stream=True):
+                full_answer += chunk
+                yield chunk
+        finally:
+            # 记录完整回答（即使客户端断连也能保存已生成部分）
+            if full_answer:
+                self.memory.add(session_id, "assistant", full_answer)

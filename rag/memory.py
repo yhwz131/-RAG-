@@ -13,13 +13,16 @@ from utils.logger import get_logger
 
 logger = get_logger("memory")
 
+# 内存中最多保留的会话数，超出后淘汰最旧的
+MAX_IN_MEMORY_SESSIONS = 100
+
 
 def estimate_tokens(text: str) -> int:
     """估算文本的 token 数"""
     cn_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
     en_words = len(re.findall(r'[a-zA-Z]+', text))
     other_chars = len(re.findall(r'[^\u4e00-\u9fffa-zA-Z]+', text))
-    return int(cn_chars * 1.5 + en_words * 1.3 + other_chars * 0.5)
+    return int(cn_chars * 2.0 + en_words * 1.3 + other_chars * 0.5)
 
 
 class ConversationMemory:
@@ -33,12 +36,16 @@ class ConversationMemory:
         self.meta: Dict[str, Dict] = {}  # session_id -> {title, created_at, updated_at}
         os.makedirs(self.sessions_dir, exist_ok=True)
         self._load_all()
+        self._evict_oldest()
         logger.info(f"对话记忆初始化: max_rounds={self.max_rounds}, max_tokens={self.max_tokens}, 已加载 {len(self.histories)} 个会话")
 
     # ---- 读写 ----
 
     def add(self, session_id: str, role: str, content: str):
         """添加一条对话记录（同时按条数和 token 数控制历史长度）"""
+        # 如果会话已被淘汰出内存，先从磁盘加载
+        if session_id not in self.histories and session_id in self.meta:
+            self._load_session(session_id)
         if session_id not in self.histories:
             self.histories[session_id] = []
             self.meta[session_id] = {
@@ -58,10 +65,13 @@ class ConversationMemory:
         self._trim_by_tokens(session_id)
         
         self._save(session_id)
+        self._evict_oldest()
         logger.debug(f"会话 [{session_id}] 添加 {role} 消息")
 
     def get_context(self, session_id: str) -> List[Dict]:
-        """获取对话上下文（供 LLM 使用）"""
+        """获取对话上下文（供 LLM 使用，按需从磁盘加载）"""
+        if session_id not in self.histories and session_id in self.meta:
+            self._load_session(session_id)
         return self.histories.get(session_id, [])
 
     def get_full_history(self, session_id: str) -> List[Dict]:
@@ -70,6 +80,7 @@ class ConversationMemory:
 
     def clear(self, session_id: str):
         """清空指定会话的对话历史"""
+        self._validate_session_id(session_id)
         self.histories.pop(session_id, None)
         self.meta.pop(session_id, None)
         path = os.path.join(self.sessions_dir, f"{session_id}.json")
@@ -86,6 +97,12 @@ class ConversationMemory:
         return sessions
 
     # ---- 内部方法 ----
+
+    @staticmethod
+    def _validate_session_id(session_id: str):
+        """校验 session_id，防止路径穿越攻击"""
+        if not session_id or not re.match(r'^[a-zA-Z0-9_-]{1,64}$', session_id):
+            raise ValueError(f"非法 session_id（仅允许字母数字下划线连字符，1-64字符）: {session_id}")
 
     def _generate_title(self, role: str, content: str) -> str:
         """从第一条用户消息生成标题"""
@@ -113,6 +130,9 @@ class ConversationMemory:
         
         if keep_from > 0:
             removed = keep_from
+            # 确保从 user 消息开始（角色配对完整性）
+            if keep_from < len(messages) and messages[keep_from].get("role") != "user":
+                keep_from += 1
             self.histories[session_id] = messages[keep_from:]
             logger.info(
                 f"会话 [{session_id}] token裁剪: 移除 {removed} 条旧消息, "
@@ -120,22 +140,33 @@ class ConversationMemory:
             )
 
     def _save(self, session_id: str):
-        """持久化单个会话到 JSON"""
+        """持久化单个会话到 JSON（原子写入：先写临时文件再 rename）"""
+        self._validate_session_id(session_id)
         path = os.path.join(self.sessions_dir, f"{session_id}.json")
+        tmp_path = path + ".tmp"
         data = {
             "meta": self.meta.get(session_id, {}),
             "messages": self.histories.get(session_id, []),
         }
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)  # 原子替换
         except Exception as e:
             logger.error(f"保存会话 {session_id} 失败: {e}")
+            # 清理可能残留的临时文件
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _load_all(self):
-        """启动时从磁盘加载所有会话"""
+        """启动时从磁盘加载所有会话元信息，仅加载最近 N 个的消息"""
         if not os.path.isdir(self.sessions_dir):
             return
+        # 第一遍：加载所有元信息
+        file_entries = []
         for fname in os.listdir(self.sessions_dir):
             if not fname.endswith(".json"):
                 continue
@@ -145,6 +176,35 @@ class ConversationMemory:
                     data = json.load(f)
                 sid = data["meta"]["session_id"]
                 self.meta[sid] = data["meta"]
-                self.histories[sid] = data.get("messages", [])
+                updated_at = data["meta"].get("updated_at", 0)
+                file_entries.append((updated_at, sid, path))
             except Exception as e:
                 logger.warning(f"加载会话 {fname} 失败: {e}")
+        # 第二遍：只加载最近 N 个会话的消息到内存
+        file_entries.sort(key=lambda x: x[0], reverse=True)
+        for _, sid, path in file_entries[:MAX_IN_MEMORY_SESSIONS]:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.histories[sid] = data.get("messages", [])
+            except Exception:
+                pass
+
+    def _load_session(self, session_id: str):
+        """按需从磁盘加载单个会话的消息（懒加载）"""
+        path = os.path.join(self.sessions_dir, f"{session_id}.json")
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.histories[session_id] = data.get("messages", [])
+        except Exception as e:
+            logger.warning(f"懒加载会话 {session_id} 失败: {e}")
+
+    def _evict_oldest(self):
+        """淘汰最旧的会话（仅释放内存，不删除磁盘文件）"""
+        while len(self.histories) > MAX_IN_MEMORY_SESSIONS:
+            oldest_sid = min(self.histories, key=lambda sid: self.meta.get(sid, {}).get("updated_at", 0))
+            del self.histories[oldest_sid]
+            logger.debug(f"淘汰会话 {oldest_sid} 出内存")

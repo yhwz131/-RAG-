@@ -6,7 +6,7 @@ import uuid
 import base64
 import tempfile
 from pathlib import Path
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
@@ -31,6 +31,16 @@ def set_rag_chain(chain: RAGChain):
 def set_mm_rag_chain(chain: RAGChain):
     global mm_rag_chain
     mm_rag_chain = chain
+
+
+def invalidate_schema_cache():
+    """清除所有 RAG 链的 schema 缓存和路由 DB 可用性缓存（数据库配置变更时调用）"""
+    from rag.router import invalidate_db_cache
+    invalidate_db_cache()
+    if rag_chain:
+        rag_chain.invalidate_schema_cache()
+    if mm_rag_chain:
+        mm_rag_chain.invalidate_schema_cache()
 
 
 class ChatFile(BaseModel):
@@ -62,6 +72,11 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=503, detail="RAG 链未初始化")
     
     session_id = req.session_id or str(uuid.uuid4())
+    
+    # 校验 session_id 防止路径穿越
+    import re as _re
+    if not _re.match(r'^[a-zA-Z0-9_-]{1,64}$', session_id):
+        raise HTTPException(status_code=400, detail=f"非法 session_id: {session_id}")
 
     # 根据模式选择链路
     if req.mode == "multimodal" and mm_rag_chain:
@@ -106,8 +121,15 @@ async def chat(req: ChatRequest):
         stream_gen = result[0] if isinstance(result, tuple) else result
 
         async def generate():
-            for chunk in stream_gen:
-                yield chunk
+            try:
+                for chunk in stream_gen:
+                    yield chunk
+            except GeneratorExit:
+                # 客户端断开连接，关闭底层同步生成器以释放 LLM 连接
+                logger.info(f"客户端断开连接，停止生成: session={session_id}")
+            finally:
+                if hasattr(stream_gen, 'close'):
+                    stream_gen.close()
 
         return StreamingResponse(generate(), media_type="text/plain")
     

@@ -10,7 +10,7 @@ pydantic-settings==2.1.0
 python-dotenv==1.0.0
 
 # 向量数据库
-pymilvus==2.3.6
+pymilvus==3.0.0
 
 # Embedding & LLM
 httpx==0.26.0

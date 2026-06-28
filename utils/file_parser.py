@@ -127,21 +127,24 @@ class FileParser:
         """解析纯文本和 Markdown 文件（自动检测编码）"""
         import chardet
         with open(file_path, "rb") as f:
+            # 只读前 10KB 检测编码，避免大文件内存爆炸
+            raw_head = f.read(10240)
+            detected = chardet.detect(raw_head)
+            encoding = detected.get("encoding") or "utf-8"
+            # chardet 有时返回 "ascii"，实际可能是 utf-8
+            if encoding.lower() == "ascii":
+                encoding = "utf-8"
+            logger.debug(f"文件 {file_path} 检测编码: {encoding} (置信度: {detected.get('confidence', 0):.0%})")
+            f.seek(0)
             raw = f.read()
-        detected = chardet.detect(raw)
-        encoding = detected.get("encoding") or "utf-8"
-        # chardet 有时返回 "ascii"，实际可能是 utf-8
-        if encoding.lower() == "ascii":
-            encoding = "utf-8"
-        logger.debug(f"文件 {file_path} 检测编码: {encoding} (置信度: {detected.get('confidence', 0):.0%})")
         return raw.decode(encoding, errors="replace")
     
     @staticmethod
     def _parse_csv(file_path: str) -> str:
-        """解析 CSV 文件"""
+        """解析 CSV 文件（限制最大 1000 行）"""
         try:
             import pandas as pd
-            df = pd.read_csv(file_path)
+            df = pd.read_csv(file_path, nrows=1000)
             return df.to_string(index=False)
         except ImportError:
             raise ImportError("请安装 pandas: pip install pandas")
@@ -180,7 +183,7 @@ class FileParser:
         xls = pd.ExcelFile(file_path)
         text_parts = []
         for sheet_name in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet_name)
+            df = pd.read_excel(xls, sheet_name=sheet_name, nrows=1000)
             if df.empty:
                 continue
             text_parts.append(f"【{sheet_name}】")
@@ -199,7 +202,7 @@ class FileParser:
         xls = pd.ExcelFile(file_path)
         pages = []
         for i, sheet_name in enumerate(xls.sheet_names, 1):
-            df = pd.read_excel(xls, sheet_name=sheet_name)
+            df = pd.read_excel(xls, sheet_name=sheet_name, nrows=1000)
             if df.empty:
                 continue
             text = f"【{sheet_name}】\n" + FileParser._df_to_markdown(df)

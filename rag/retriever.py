@@ -3,6 +3,7 @@
 基于 Milvus Lite 本地向量数据库进行相似度搜索，支持混合检索（向量 + BM25）
 """
 import os
+import time
 import hashlib
 import base64
 import httpx
@@ -26,7 +27,20 @@ class VectorRetriever:
         self._connect()
         self._ensure_collection()
         self._bm25_docs: List[Dict] = []  # 缓存文档用于BM25检索
+        self._bm25_instance = None  # BM25Okapi 实例缓存
+        self._corpus_tokens: List[List[str]] = []  # 分词结果缓存
         self._update_bm25_cache()
+
+    def close(self):
+        """关闭底层资源（EmbeddingClient 连接池 + Milvus 连接）"""
+        try:
+            if hasattr(self, 'embedder') and self.embedder:
+                self.embedder.close()
+            if hasattr(self, '_client') and self._client:
+                self._client.close()
+            logger.info("VectorRetriever 资源已释放")
+        except Exception as e:
+            logger.warning(f"VectorRetriever 关闭异常: {e}")
     
     def _connect(self):
         """连接 Milvus Lite（本地文件模式）"""
@@ -78,10 +92,21 @@ class VectorRetriever:
                     break
                 offset += batch_size
             self._bm25_docs = all_results
+            # 构建 BM25 实例（分词 + 构建一次性完成）
+            try:
+                import jieba
+                from rank_bm25 import BM25Okapi
+                self._corpus_tokens = [list(jieba.cut(doc.get("content", ""))) for doc in self._bm25_docs]
+                self._bm25_instance = BM25Okapi(self._corpus_tokens)
+            except ImportError:
+                logger.warning("jieba/rank_bm25 未安装，BM25 检索不可用")
+                self._bm25_instance = None
             logger.info(f"BM25 缓存更新完成: {len(self._bm25_docs)} 条文档")
         except Exception as e:
             logger.warning(f"BM25 缓存更新失败: {e}")
             self._bm25_docs = []
+            self._bm25_instance = None
+            self._corpus_tokens = []
     
     def insert_documents(self, chunks: List[Dict]) -> int:
         """将文档切片插入 Milvus
@@ -190,21 +215,18 @@ class VectorRetriever:
             raise
     
     def _bm25_search(self, query: str, top_k: int = 5) -> List[Dict]:
-        """BM25 关键词检索"""
-        if not self._bm25_docs:
+        """BM25 关键词检索（使用缓存的 BM25 实例，仅分词查询）"""
+        if not self._bm25_docs or self._bm25_instance is None:
             return []
         
         try:
             import jieba
-            from rank_bm25 import BM25Okapi
             
-            # 分词
+            # 仅对查询分词（语料已在 _update_bm25_cache 中预分词）
             query_tokens = list(jieba.cut(query))
-            corpus_tokens = [list(jieba.cut(doc.get("content", ""))) for doc in self._bm25_docs]
             
-            # BM25 检索
-            bm25 = BM25Okapi(corpus_tokens)
-            scores = bm25.get_scores(query_tokens)
+            # 使用缓存的 BM25 实例
+            scores = self._bm25_instance.get_scores(query_tokens)
             
             # 获取 Top-K 结果
             import numpy as np
@@ -277,23 +299,27 @@ class VectorRetriever:
         return docs
     
     def _rrf_fusion(self, vector_results: List[Dict], keyword_results: List[Dict], k: int = None) -> List[Dict]:
-        """RRF (Reciprocal Rank Fusion) 融合排序
+        """RRF (Reciprocal Rank Fusion) 融合排序（加权版）
+        
+        向量检索权重更高（语义匹配更可靠），BM25 权重较低（关键词匹配噪音多）。
         
         Args:
             k: RRF 参数，默认从配置读取
         """
         k = k or settings.rrf_k
+        VECTOR_WEIGHT = 1.5   # 向量检索权重
+        KEYWORD_WEIGHT = 0.8  # BM25 权重
         scores = {}
         doc_map = {}
         
         for rank, doc in enumerate(vector_results):
             key = doc.get("chunk_id") or doc.get("content", "")[:100]
-            scores[key] = scores.get(key, 0) + 1.0 / (k + rank + 1)
+            scores[key] = scores.get(key, 0) + VECTOR_WEIGHT / (k + rank + 1)
             doc_map[key] = doc
         
         for rank, doc in enumerate(keyword_results):
             key = doc.get("chunk_id") or doc.get("content", "")[:100]
-            scores[key] = scores.get(key, 0) + 1.0 / (k + rank + 1)
+            scores[key] = scores.get(key, 0) + KEYWORD_WEIGHT / (k + rank + 1)
             if key not in doc_map:
                 doc_map[key] = doc
         
@@ -328,21 +354,28 @@ class VectorRetriever:
         # 2. BM25 关键词检索
         keyword_results = self._bm25_search(query, top_k=candidate_k)
         
-        # 3. RRF 融合排序
+        # 3. RRF 融合排序 + 分路径阈值过滤
         if keyword_results:
             fused_results = self._rrf_fusion(vector_results, keyword_results)
+            # RRF 路径：用 rrf_threshold（值域 ~0.01-0.05）
+            rrf_threshold = settings.rrf_threshold
+            before = len(fused_results)
+            if rrf_threshold > 0:
+                fused_results = [r for r in fused_results if r.get("score", 0) >= rrf_threshold]
+                if len(fused_results) < before:
+                    logger.info(
+                        f"RRF 阈值过滤: {before} → {len(fused_results)} 条 "
+                        f"(rrf_threshold={rrf_threshold})"
+                    )
         else:
-            fused_results = vector_results
-        
-        # 4. RRF 融合分数阈值过滤
-        rrf_threshold = settings.rrf_threshold
-        before = len(fused_results)
-        if rrf_threshold > 0:
-            fused_results = [r for r in fused_results if r.get("score", 0) >= rrf_threshold]
+            # 纯向量路径：用 similarity_threshold（值域 ~0.3-0.9）
+            sim_threshold = settings.similarity_threshold
+            before = len(vector_results)
+            fused_results = [r for r in vector_results if r.get("score", 0) >= sim_threshold]
             if len(fused_results) < before:
                 logger.info(
-                    f"RRF 阈值过滤: {before} → {len(fused_results)} 条 "
-                    f"(rrf_threshold={rrf_threshold})"
+                    f"相似度阈值过滤: {before} → {len(fused_results)} 条 "
+                    f"(similarity_threshold={sim_threshold})"
                 )
         
         results = fused_results[:top_k]
@@ -379,10 +412,39 @@ class VectorRetriever:
     def get_document_count(self) -> int:
         """获取文档切片总数"""
         try:
-            self.collection.flush()
-            return self.collection.num_entities
+            stats = self._client.get_collection_stats(self.collection_name)
+            return int(stats.get("row_count", 0))
         except Exception:
             return 0
+
+    def list_all_files(self) -> List[Dict]:
+        """列出知识库中所有文件（枚举查询，不走向量检索）
+
+        Returns:
+            [{"filename": "xxx.pdf", "chunk_count": 5}, ...]
+        """
+        try:
+            self._client.load_collection(self.collection_name)
+            all_docs = self._client.query(
+                self.collection_name,
+                filter='chunk_id != ""',
+                output_fields=["filename"],
+                limit=10000,
+            )
+            # 统计每个文件的切片数
+            file_counts: dict[str, int] = {}
+            for doc in all_docs:
+                fname = doc.get("filename", "未知")
+                file_counts[fname] = file_counts.get(fname, 0) + 1
+            result = [
+                {"filename": fname, "chunk_count": count}
+                for fname, count in sorted(file_counts.items())
+            ]
+            logger.info(f"枚举查询: 共 {len(result)} 个文件, {len(all_docs)} 个切片")
+            return result
+        except Exception as e:
+            logger.error(f"枚举文件列表失败: {e}")
+            return []
 
 
 class MultimodalRetriever:
@@ -398,7 +460,25 @@ class MultimodalRetriever:
         self._connect()
         self._ensure_collection()
         self._bm25_docs: List[Dict] = []
+        # 图片描述 LLM 专用连接池（复用连接，避免每次调用新建）
+        self._mm_llm_client = httpx.Client(
+            timeout=30,
+            limits=httpx.Limits(max_connections=5, max_keepalive_connections=3, keepalive_expiry=30),
+        )
         self._update_bm25_cache()
+
+    def close(self):
+        """关闭底层资源（MultimodalEmbedder 连接池 + Milvus 连接 + LLM httpx）"""
+        try:
+            if hasattr(self, '_mm_llm_client') and self._mm_llm_client:
+                self._mm_llm_client.close()
+            if hasattr(self, 'embedder') and self.embedder:
+                self.embedder.close()
+            if hasattr(self, '_client') and self._client:
+                self._client.close()
+            logger.info("MultimodalRetriever 资源已释放")
+        except Exception as e:
+            logger.warning(f"MultimodalRetriever 关闭异常: {e}")
 
     def _connect(self):
         """连接 Milvus Lite"""
@@ -704,29 +784,30 @@ class MultimodalRetriever:
         last_error = None
         for attempt in range(max_retries + 1):
             try:
-                with httpx.Client(timeout=30) as client:
-                    resp = client.post(
-                        settings.mm_llm_api_url, json=payload, headers=headers
-                    )
-                    resp.raise_for_status()
-                    desc = resp.json()["choices"][0]["message"]["content"].strip()
+                resp = self._mm_llm_client.post(
+                    settings.mm_llm_api_url, json=payload, headers=headers
+                )
+                resp.raise_for_status()
+                desc = resp.json()["choices"][0]["message"]["content"].strip()
 
-                    # 验证描述是否有效（过滤 LLM 无法识别的回复）
-                    desc_lower = desc.lower()
-                    is_failure = any(kw in desc_lower for kw in failure_keywords)
-                    if is_failure:
-                        last_error = f"LLM 返回无效描述: {desc[:50]}"
-                        logger.warning(
-                            f"图片描述生成返回无效内容 (尝试 {attempt + 1}/{max_retries + 1}): "
-                            f"{source} 第{page}页 -> {desc[:80]}"
-                        )
-                        continue  # 重试
-
-                    # 有效描述
-                    logger.info(
-                        f"图片描述生成成功: {source} 第{page}页 -> {desc[:50]}..."
+                # 验证描述是否有效（过滤 LLM 无法识别的回复）
+                desc_lower = desc.lower()
+                is_failure = any(kw in desc_lower for kw in failure_keywords)
+                if is_failure:
+                    last_error = f"LLM 返回无效描述: {desc[:50]}"
+                    logger.warning(
+                        f"图片描述生成返回无效内容 (尝试 {attempt + 1}/{max_retries + 1}): "
+                        f"{source} 第{page}页 -> {desc[:80]}"
                     )
-                    return f"[图片] {desc}（来源: {source}, 第{page}页）"
+                    if attempt < max_retries:
+                        time.sleep(1 * (2 ** attempt))  # 指数退避: 1s, 2s
+                    continue  # 重试
+
+                # 有效描述
+                logger.info(
+                    f"图片描述生成成功: {source} 第{page}页 -> {desc[:50]}..."
+                )
+                return f"[图片] {desc}（来源: {source}, 第{page}页）"
 
             except Exception as e:
                 last_error = str(e)
@@ -734,6 +815,8 @@ class MultimodalRetriever:
                     f"图片描述生成异常 (尝试 {attempt + 1}/{max_retries + 1}): "
                     f"{source} 第{page}页 -> {e}"
                 )
+                if attempt < max_retries:
+                    time.sleep(1 * (2 ** attempt))  # 指数退避: 1s, 2s
                 continue  # 重试
 
         # 所有重试均失败，降级为默认标签
@@ -743,21 +826,20 @@ class MultimodalRetriever:
         return f"[图片] 来源: {source}, 第{page}页"
 
     def search(self, query: str, top_k: int = None) -> List[Dict]:
-        """多模态纯向量检索
+        """多模态混合检索：向量检索 + BM25 关键词 + RRF 融合 + 相似度阈值
 
-        策略：仅使用 Qwen3-VL 多模态 embedding 做语义相似度检索。
-        不使用 BM25，原因：
-        1. 多模态 collection 含大量图片描述文本，BM25 关键词匹配效果极差
-        2. BM25 在 langchain 截图描述中匹配到无关高频词，产生大量噪音
-        3. Qwen3-VL 4096d embedding 已能准确理解文本+图片语义
+        策略：
+        1. Qwen3-VL 4096d embedding 做语义相似度检索
+        2. BM25 关键词检索补充精确匹配能力
+        3. RRF 融合两路结果
+        4. 相似度阈值过滤低质量结果
 
         去重策略：同一来源文件只保留分数最高的 1 条，避免单文件霸榜。
         """
         top_k = top_k or settings.top_k
-        # 扩大候选池再做去重，保证去重后仍有足够结果
         candidate_k = max(top_k * 10, 50)
 
-        # 向量检索（用多模态模型编码查询）
+        # 1. 向量检索（用多模态模型编码查询）
         query_vector = self.embedder.embed_text(query)
         results = self._client.search(
             self.collection_name,
@@ -788,10 +870,34 @@ class MultimodalRetriever:
                 "source_type": "vector"
             })
 
-        # 文件来源去重：同一文件只保留分数最高的 1 条
+        # 2. BM25 关键词检索（补充精确匹配）
+        keyword_results = self._bm25_search(query, top_k=candidate_k)
+
+        # 3. 融合排序
+        if keyword_results:
+            fused_results = self._rrf_fusion(all_docs, keyword_results)
+            # RRF 路径：用 rrf_threshold
+            rrf_threshold = settings.rrf_threshold
+            before_fusion = len(fused_results)
+            if rrf_threshold > 0:
+                fused_results = [r for r in fused_results if r.get("score", 0) >= rrf_threshold]
+                if len(fused_results) < before_fusion:
+                    logger.info(f"多模态 RRF 阈值过滤: {before_fusion} → {len(fused_results)} 条")
+        else:
+            # 纯向量路径：用 similarity_threshold
+            sim_threshold = settings.similarity_threshold
+            before_filter = len(all_docs)
+            fused_results = [r for r in all_docs if r.get("score", 0) >= sim_threshold]
+            if len(fused_results) < before_filter:
+                logger.info(
+                    f"多模态相似度阈值过滤: {before_filter} → {len(fused_results)} 条 "
+                    f"(similarity_threshold={sim_threshold})"
+                )
+
+        # 4. 文件来源去重：同一文件只保留分数最高的 1 条
         seen_files: set[str] = set()
         vector_docs = []
-        for doc in all_docs:
+        for doc in fused_results:
             fname = doc["source"]
             if fname not in seen_files:
                 seen_files.add(fname)
@@ -801,17 +907,53 @@ class MultimodalRetriever:
 
         logger.info(
             f"多模态检索完成: 候选={len(all_docs)}, "
-            f"去重丢弃={len(all_docs) - len(vector_docs)}, "
+            f"关键词={len(keyword_results)}, "
+            f"去重丢弃={len(fused_results) - len(vector_docs)}, "
             f"最终={len(vector_docs)}"
         )
         for i, r in enumerate(vector_docs):
             logger.info(
                 f"  [{i+1}] 来源={r.get('source', '?')}, "
                 f"页码={r.get('page_number', 0)}, "
-                f"cosine={r.get('score', 0):.4f}, "
+                f"分数={r.get('score', 0):.4f}, "
+                f"类型={r.get('source_type', '?')}, "
                 f"has_image={r.get('has_image', False)}"
             )
         return vector_docs
+
+    def _bm25_search(self, query: str, top_k: int = 5) -> List[Dict]:
+        """BM25 关键词检索（使用缓存的 BM25 实例，仅分词查询）"""
+        if not self._bm25_docs:
+            return []
+        try:
+            from rank_bm25 import BM25Okapi
+            import jieba
+
+            corpus_tokens = [list(jieba.cut(doc.get("content", ""))) for doc in self._bm25_docs]
+            bm25 = BM25Okapi(corpus_tokens)
+            query_tokens = list(jieba.cut(query))
+            scores = bm25.get_scores(query_tokens)
+
+            import numpy as np
+            top_indices = np.argsort(scores)[::-1][:top_k]
+
+            results = []
+            for idx in top_indices:
+                if scores[idx] > 0:
+                    results.append({
+                        "content": self._bm25_docs[idx].get("content", ""),
+                        "source": self._bm25_docs[idx].get("filename", "未知"),
+                        "chunk_id": self._bm25_docs[idx].get("chunk_id", ""),
+                        "page_number": self._bm25_docs[idx].get("page_number", 0),
+                        "has_image": self._bm25_docs[idx].get("has_image", False),
+                        "image_url": self._bm25_docs[idx].get("image_url", ""),
+                        "score": float(scores[idx]),
+                        "source_type": "keyword"
+                    })
+            return results
+        except Exception as e:
+            logger.warning(f"多模态 BM25 检索失败: {e}")
+            return []
 
     @staticmethod
     def _rrf_fusion(

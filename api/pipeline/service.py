@@ -160,10 +160,13 @@ class PipelineService:
         保存数据库配置到 .env 文件并重建数据源
         """
         import re
+        import shutil
 
         env_path = ".env"
         env_lines = []
         if os.path.exists(env_path):
+            # 备份原 .env，防止写入失败导致配置丢失
+            shutil.copy2(env_path, env_path + ".bak")
             with open(env_path, "r", encoding="utf-8") as f:
                 env_lines = f.readlines()
 
@@ -173,26 +176,22 @@ class PipelineService:
             "db_password", "db_name", "db_table", "db_text_columns",
         ]
 
-        # 构建新配置行
-        new_lines = []
-        for key in db_keys:
-            value = config.get(key, "")
-            # db_text_columns 可能是 list（前端传来的），需要转为逗号分隔字符串
-            if key == "db_text_columns" and isinstance(value, list):
-                value = ",".join(value)
-            new_lines.append(f"{key.upper()}={value}\n")
+        def _quote_env_value(value: str) -> str:
+            """对含特殊字符的值加双引号，防止 .env 解析异常"""
+            value = str(value)
+            if any(c in value for c in (' ', '#', '=', '"', "'", '\n')):
+                return '"' + value.replace('"', '\\"') + '"'
+            return value
 
         # 替换或追加
         updated_keys = set()
         for i, line in enumerate(env_lines):
             for key in db_keys:
                 if line.strip().startswith(f"{key.upper()}="):
-                    env_lines[i] = f"{key.upper()}={config.get(key, '')}\n"
-                    if key == "db_text_columns":
-                        cols = config.get(key, "")
-                        if isinstance(cols, list):
-                            cols = ",".join(cols)
-                        env_lines[i] = f"DB_TEXT_COLUMNS={cols}\n"
+                    value = config.get(key, "")
+                    if key == "db_text_columns" and isinstance(value, list):
+                        value = ",".join(value)
+                    env_lines[i] = f"{key.upper()}={_quote_env_value(value)}\n"
                     updated_keys.add(key)
                     break
 
@@ -200,7 +199,9 @@ class PipelineService:
         for key in db_keys:
             if key not in updated_keys:
                 value = config.get(key, "")
-                env_lines.append(f"{key.upper()}={value}\n")
+                if key == "db_text_columns" and isinstance(value, list):
+                    value = ",".join(value)
+                env_lines.append(f"{key.upper()}={_quote_env_value(value)}\n")
 
         with open(env_path, "w", encoding="utf-8") as f:
             f.writelines(env_lines)
@@ -380,8 +381,10 @@ class PipelineService:
     # ========== 内部方法 ==========
 
     def _import_to_milvus(self, chunks_file: str) -> int:
-        """将切片数据导入 Milvus（文本 + 多模态双写）"""
+        """将切片数据导入 Milvus（文本 + 多模态双写 + 图片提取）"""
         try:
+            from utils.file_parser import FileParser
+
             with open(chunks_file, "r", encoding="utf-8") as f:
                 chunks = json.load(f)
             if not chunks:
@@ -397,12 +400,63 @@ class PipelineService:
                 try:
                     mm_count = self._mm_retriever.insert_documents(chunks)
                     logger.info(f"多模态 Collection 同步写入: {mm_count} 条")
+                    # 从原始文件中提取图片并入库到多模态 Collection
+                    self._extract_and_import_images(chunks_file)
                 except Exception as e:
                     logger.warning(f"多模态入库失败（不影响文本链路）: {e}")
             return count
         except Exception as e:
             logger.error(f"导入 Milvus 失败: {e}")
             return 0
+
+    def _extract_and_import_images(self, chunks_file: str):
+        """从原始文件中提取图片并入库到多模态 Collection"""
+        from utils.file_parser import FileParser
+
+        try:
+            # 找到原始文件目录（chunks_file 的父目录的 raw 目录）
+            chunks_dir = os.path.dirname(chunks_file)
+            raw_dir = os.path.join(os.path.dirname(chunks_dir), "raw")
+            if not os.path.exists(raw_dir):
+                logger.warning(f"原始文件目录不存在: {raw_dir}")
+                return
+
+            # 扫描所有可提取图片的文件
+            supported_exts = {".pdf", ".docx", ".doc", ".pptx", ".ppt"}
+            total_images = 0
+            for fname in os.listdir(raw_dir):
+                fpath = os.path.join(raw_dir, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in supported_exts:
+                    continue
+
+                # 图片保存目录
+                file_id = os.path.splitext(fname)[0]
+                img_dir = os.path.join(settings.upload_dir, "images", file_id)
+                images = []
+                try:
+                    if ext == ".pdf":
+                        images = FileParser.extract_images_from_pdf(fpath, img_dir)
+                    elif ext in (".docx", ".doc"):
+                        images = FileParser.extract_images_from_docx(fpath, img_dir)
+                    elif ext in (".pptx", ".ppt"):
+                        images = FileParser.extract_images_from_pptx(fpath, img_dir)
+                except Exception as e:
+                    logger.warning(f"图片提取失败 {fname}: {e}")
+                    continue
+
+                if images:
+                    # 去掉 UUID 前缀得到原始文件名
+                    source_name = self._strip_uuid_prefix(fname)
+                    inserted = self._mm_retriever.insert_images(images, source=source_name)
+                    total_images += inserted
+                    logger.info(f"图片入库: {source_name} -> {inserted} 张")
+
+            logger.info(f"图片提取入库完成: 共 {total_images} 张图片")
+        except Exception as e:
+            logger.warning(f"图片提取入库异常（不影响文本链路）: {e}")
 
     @staticmethod
     def _strip_uuid_prefix(name: str) -> str:

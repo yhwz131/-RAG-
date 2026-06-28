@@ -1,7 +1,7 @@
 ---
 name: multimodal-image
 description: |
-  多模态图片理解技能。当用户在 Copilot Chat 中粘贴/上传图片时，使用此技能调用 mimo-v2-omni 模型来分析图片内容。
+  多模态图片理解技能。当用户在 Copilot Chat 中粘贴/上传图片时，使用此技能调用 mimo-v2.5 模型来分析图片内容。
   触发条件：用户消息中包含图片附件（attachment），且当前基座模型不支持多模态输入时。
   典型场景：用户粘贴截图提问、上传图片要求分析、发送错误截图求助等。
 metadata:
@@ -27,7 +27,7 @@ metadata:
 
 ## 目的
 
-当用户在 VS Code Copilot Chat 中粘贴或上传图片时，调用 `mimo-v2-omni` 多模态大模型来理解图片内容，
+当用户在 VS Code Copilot Chat 中粘贴或上传图片时，调用 `mimo-v2.5` 多模态大模型来理解图片内容，
 然后将图片描述作为上下文传递给基座模型进行后续处理。
 
 ## ⛔ 触发条件
@@ -72,7 +72,7 @@ python3 /home/yhwz/knowledge-qa-system/.github/skills/multimodal-image/image_des
 
 将脚本返回的图片描述整合到你的回复中：
 
-1. **图片内容描述**：将 mimo-v2-omni 返回的描述作为"图片分析"提供给用户
+1. **图片内容描述**：将 mimo-v2.5 返回的描述作为"图片分析"提供给用户
 2. **结合用户问题**：根据图片描述和用户的问题，给出完整的回答
 3. **如果图片包含代码/报错**：提取关键信息，给出解决方案
 
@@ -81,7 +81,7 @@ python3 /home/yhwz/knowledge-qa-system/.github/skills/multimodal-image/image_des
 回复时使用以下格式：
 
 ```
-📸 **图片分析**：[mimo-v2-omni 返回的图片描述]
+📸 **图片分析**：[mimo-v2.5 返回的图片描述]
 
 [基于图片内容和用户问题的完整回答]
 ```
@@ -105,7 +105,7 @@ python3 /home/yhwz/knowledge-qa-system/.github/skills/multimodal-image/image_des
 
 ## API 配置
 
-- **模型**: mimo-v2-omni
+- **模型**: mimo-v2.5
 - **API 端点**: https://token-plan-cn.xiaomimimo.com/v1/chat/completions
 - **认证**: Bearer Token（从 `.env` 的 `LLM_API_KEY` 读取）
 - **图片编码**: Base64（自动处理）

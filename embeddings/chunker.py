@@ -40,7 +40,16 @@ class TextChunker:
         idx = 0
         
         while start < len(text):
-            end = start + self.chunk_size
+            end = min(start + self.chunk_size, len(text))
+            
+            # 句子边界对齐：尽量在句号/换行处切断，避免截断句子
+            if end < len(text):
+                for sep in ['\n', '。', '！', '？', '.', '!', '?', '；', '，', ',']:
+                    last_sep = text.rfind(sep, start + self.chunk_size // 2, end)
+                    if last_sep > start:
+                        end = last_sep + 1
+                        break
+            
             content = text[start:end]
             
             # 生成唯一ID

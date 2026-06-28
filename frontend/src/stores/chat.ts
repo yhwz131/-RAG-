@@ -3,6 +3,18 @@ import { ref } from 'vue'
 import type { SessionInfo, ChatMessage, Reference } from '@/api'
 import { listSessions, getSessionHistory, deleteSession, clearHistory } from '@/api'
 
+/** 兼容非 HTTPS 环境的 UUID 生成（crypto.randomUUID 仅在 secure context 可用） */
+function generateId(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID()
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    const v = c === 'x' ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
+}
+
 /** 待发送的文件 */
 export interface PendingFile {
   id: string
@@ -54,7 +66,7 @@ export const useChatStore = defineStore('chat', () => {
 
   // 新建会话
   function newSession() {
-    const sid = crypto.randomUUID()
+    const sid = generateId()
     sessionId.value = sid
     messages.value = []
     currentReferences.value = []
@@ -98,7 +110,7 @@ export const useChatStore = defineStore('chat', () => {
         const result = reader.result as string
         const base64 = result.split(',')[1] || ''
         pendingFiles.value.push({
-          id: crypto.randomUUID(),
+          id: generateId(),
           file,
           preview: isImage ? URL.createObjectURL(file) : null,
           base64,

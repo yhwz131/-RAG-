@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-多模态图片分析脚本 — 调用 mimo-v2-omni 模型理解图片内容
+多模态图片分析脚本 — 调用 mimo-v2.5 模型理解图片内容
 
 用法:
     python3 image_describe.py <图片路径> [用户问题]
@@ -9,7 +9,7 @@
 环境变量（可从 .env 自动加载）:
     LLM_API_KEY   — API 密钥（必需）
     LLM_BASE_URL   — API 端点（默认 https://token-plan-cn.xiaomimimo.com/v1）
-    MM_LLM_MODEL   — 模型名（默认 mimo-v2-omni）
+    MM_LLM_MODEL   — 模型名（默认 mimo-v2.5）
 """
 
 import sys
@@ -45,7 +45,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 # ---------- 配置 ----------
 API_KEY = os.environ.get("LLM_API_KEY", "")
 BASE_URL = os.environ.get("LLM_BASE_URL", "https://token-plan-cn.xiaomimimo.com/v1").rstrip("/")
-MODEL = os.environ.get("MM_LLM_MODEL", "mimo-v2-omni")
+MODEL = os.environ.get("MM_LLM_MODEL", "mimo-v2.5")
 API_ENDPOINT = f"{BASE_URL}/chat/completions"
 
 # 支持的图片格式
@@ -99,7 +99,7 @@ def build_image_url(source: str) -> str:
 
 
 def call_mimo_omni(image_url: str, question: str) -> str:
-    """调用 mimo-v2-omni API 分析图片"""
+    """调用 mimo-v2.5 API 分析图片"""
     import httpx
 
     payload = {
@@ -134,7 +134,7 @@ def call_mimo_omni(image_url: str, question: str) -> str:
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="调用 mimo-v2-omni 分析图片")
+    parser = argparse.ArgumentParser(description="调用 mimo-v2.5 分析图片")
     parser.add_argument("image", help="图片文件路径或 --url 图片URL")
     parser.add_argument("--url", action="store_true", help="将 image 参数作为 URL 处理")
     parser.add_argument("question", nargs="?", default=DEFAULT_PROMPT, help="用户问题（可选）")

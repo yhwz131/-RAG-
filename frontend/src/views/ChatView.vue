@@ -7,6 +7,36 @@
           <el-icon><Plus /></el-icon>
           <span v-if="!store.sidebarCollapsed">新建对话</span>
         </el-button>
+        <el-button
+          v-if="!store.sidebarCollapsed && store.sessions.length > 0"
+          text
+          size="small"
+          @click="toggleBatchMode"
+          :type="batchMode ? 'danger' : 'default'"
+          class="batch-toggle-btn"
+        >
+          <el-icon><Edit /></el-icon>
+          <span>{{ batchMode ? '取消' : '管理' }}</span>
+        </el-button>
+      </div>
+
+      <!-- 批量操作栏 -->
+      <div v-if="batchMode && !store.sidebarCollapsed" class="batch-bar">
+        <el-checkbox
+          v-model="allSelected"
+          :indeterminate="isIndeterminate"
+          @change="toggleSelectAll"
+        >
+          全选 ({{ selectedSessions.size }}/{{ store.sessions.length }})
+        </el-checkbox>
+        <el-button
+          type="danger"
+          size="small"
+          :disabled="selectedSessions.size === 0"
+          @click="handleBatchDelete"
+        >
+          删除 ({{ selectedSessions.size }})
+        </el-button>
       </div>
 
       <div class="session-list" v-if="!store.sidebarCollapsed">
@@ -15,11 +45,19 @@
           :key="s.session_id"
           class="session-item"
           :class="{ active: s.session_id === store.sessionId }"
-          @click="handleSwitchSession(s.session_id)"
+          @click="batchMode ? toggleSelect(s.session_id) : handleSwitchSession(s.session_id)"
         >
+          <el-checkbox
+            v-if="batchMode"
+            :model-value="selectedSessions.has(s.session_id)"
+            @click.stop
+            @change="toggleSelect(s.session_id)"
+            class="session-checkbox"
+          />
           <el-icon class="session-icon"><ChatLineSquare /></el-icon>
           <span class="session-title">{{ s.title || '新对话' }}</span>
           <el-icon
+            v-if="!batchMode"
             class="delete-icon"
             @click.stop="handleDeleteSession(s.session_id)"
           >
@@ -207,10 +245,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Delete, Promotion, Connection, User, Collection, ChatLineSquare, DArrowLeft, DArrowRight, Picture, CloseBold, Document, UploadFilled } from '@element-plus/icons-vue'
+import { Plus, Delete, Promotion, Connection, User, Collection, ChatLineSquare, DArrowLeft, DArrowRight, Picture, CloseBold, Document, UploadFilled, Edit } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import { useChatStore } from '@/stores/chat'
 import { chatStream } from '@/api'
@@ -224,6 +262,12 @@ const messagesRef = ref<HTMLElement>()
 const streamingContent = ref('')
 const fileInputRef = ref<HTMLInputElement>()
 const isDragging = ref(false)
+
+// 批量选择模式
+const batchMode = ref(false)
+const selectedSessions = ref<Set<string>>(new Set())
+const allSelected = computed(() => store.sessions.length > 0 && selectedSessions.value.size === store.sessions.length)
+const isIndeterminate = computed(() => selectedSessions.value.size > 0 && selectedSessions.value.size < store.sessions.length)
 
 const modeOptions = [
   { label: '📄 纯文本', value: 'text' },
@@ -387,6 +431,56 @@ async function handleDeleteSession(sid: string) {
   } catch { /* 取消 */ }
 }
 
+// 批量选择相关
+function toggleBatchMode() {
+  batchMode.value = !batchMode.value
+  if (!batchMode.value) {
+    selectedSessions.value.clear()
+  }
+}
+
+function toggleSelect(sid: string) {
+  if (selectedSessions.value.has(sid)) {
+    selectedSessions.value.delete(sid)
+  } else {
+    selectedSessions.value.add(sid)
+  }
+  // 触发响应式更新
+  selectedSessions.value = new Set(selectedSessions.value)
+}
+
+function toggleSelectAll(val: boolean) {
+  if (val) {
+    selectedSessions.value = new Set(store.sessions.map(s => s.session_id))
+  } else {
+    selectedSessions.value.clear()
+    selectedSessions.value = new Set()
+  }
+}
+
+async function handleBatchDelete() {
+  const count = selectedSessions.value.size
+  if (count === 0) return
+  try {
+    await ElMessageBox.confirm(`确定要删除选中的 ${count} 个会话吗？`, '批量删除', {
+      confirmButtonText: `删除 ${count} 个`,
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+    let deleted = 0
+    for (const sid of selectedSessions.value) {
+      try {
+        await store.removeSession(sid)
+        deleted++
+      } catch { /* ignore */ }
+    }
+    selectedSessions.value.clear()
+    selectedSessions.value = new Set()
+    batchMode.value = false
+    ElMessage.success(`已删除 ${deleted} 个会话`)
+  } catch { /* 取消 */ }
+}
+
 // 清空历史
 async function handleClearHistory() {
   try {
@@ -507,6 +601,33 @@ watch(() => route.params.sessionId, async (sid) => {
 
 .session-item:hover .delete-icon {
   opacity: 1;
+}
+
+/* 批量选择模式 */
+.batch-toggle-btn {
+  margin-left: 4px;
+  font-size: 12px;
+}
+
+.batch-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-card);
+}
+
+.batch-bar .el-checkbox {
+  font-size: 12px;
+}
+
+.session-checkbox {
+  margin-right: 4px;
+}
+
+.session-item:has(.session-checkbox) {
+  cursor: pointer;
 }
 
 .empty-sessions {
