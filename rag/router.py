@@ -118,6 +118,18 @@ def rule_based_route(query: str) -> Optional[QueryType]:
         if re.match(pattern, query_clean):
             logger.debug(f"规则匹配命中: {query} -> chitchat")
             return QueryType.CHITCHAT
+
+    # 系统元问题 → general（不走 RAG，知识库里没有系统自身的信息）
+    _META_PATTERNS = [
+        r'(本项目|本系统|这个系统|你的系统|该系统).*(架构|功能|介绍|说明|描述)',
+        r'(你是干嘛的|你是做什么的|你是什么|你的功能|你能做什么)',
+        r'(系统架构|项目架构|技术架构|系统设计).*(介绍|说明|描述|是什么)',
+    ]
+    for pattern in _META_PATTERNS:
+        if re.search(pattern, query_clean):
+            logger.debug(f"规则匹配命中: {query} -> general (系统元问题)")
+            return QueryType.GENERAL
+
     return None
 
 
