@@ -31,7 +31,7 @@ from api.routes_pipeline import (
     router as pipeline_router,
     set_pipeline_retriever, set_pipeline_mm_retriever,
 )
-from rag.router import close_http_client
+from rag.router import close_http_client, set_retriever as set_router_retriever
 
 logger = get_logger("api")
 
@@ -54,6 +54,7 @@ async def lifespan(app: FastAPI):
         set_retriever(text_retriever)
         set_chunker(chunker)
         set_pipeline_retriever(text_retriever)
+        set_router_retriever(text_retriever)  # 路由模块文档清单
         logger.info("纯文本链路初始化完成")
     except Exception as e:
         logger.error(f"纯文本链路初始化失败（服务不可用）: {e}")

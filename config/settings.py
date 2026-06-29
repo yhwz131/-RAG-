@@ -40,9 +40,19 @@ class Settings(BaseSettings):
     # ========== 检索配置 ==========
     retriever_top_k: int = 5
     similarity_threshold: float = 0.5
-    rrf_threshold: float = 0.005  # RRF 融合分数阈值，低于此值的结果被过滤
+    rrf_threshold: float = 0  # RRF 融合分数阈值，0=关闭硬过滤，依赖 Reranker 截断
+    adaptive_filter_ratio: float = 0.6  # 相对阈值：保留 top1 * ratio 以上结果
     max_context_tokens: int = 3000  # 上下文最大 token 数
     rrf_k: int = 20  # RRF (Reciprocal Rank Fusion) 参数，小规模知识库用 20 区分度更好
+    
+    # ========== Reranker 精排配置 ==========
+    reranker_enabled: bool = True  # 是否启用 Reranker 精排
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"  # Reranker 模型名
+    reranker_top_k: int = 5  # Reranker 返回数量
+    
+    # ========== 多查询检索配置 ==========
+    multi_query_enabled: bool = True  # 跨文档查询拆分子查询分别检索
+    multi_query_max_sub: int = 3  # 最多拆分几个子查询
     
     # ========== 对话记忆配置 ==========
     max_history_rounds: int = 10

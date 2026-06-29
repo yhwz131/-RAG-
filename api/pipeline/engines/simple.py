@@ -42,46 +42,79 @@ class SimpleEngine(PipelineEngine):
         files = self._scan_files(input_dir)
         logger.info(f"扫描到 {len(files)} 个文件")
 
-        # 2. 解析 + 清洗
+        # 2. 解析 + 清洗（按文件分组，保留 doc_type）
         raw_pages = []
         failed_files = []
         format_breakdown: Dict[str, int] = {}
+        file_doc_types: Dict[str, str] = {}  # filename -> doc_type
 
         for filepath in files:
             ext = os.path.splitext(filepath)[1].lower()
             format_breakdown[ext] = format_breakdown.get(ext, 0) + 1
+            filename = os.path.basename(filepath)
             try:
                 pages = parser.parse_with_pages(filepath)
                 if pages:
+                    # 记录 doc_type（去掉前导点）
+                    doc_type = ext.lstrip(".") if ext else ""
+                    file_doc_types[filename] = doc_type
                     for p in pages:
-                        p["_source"] = os.path.basename(filepath)
+                        p["_source"] = filename
+                        p["_doc_type"] = doc_type
                     raw_pages.extend(pages)
             except Exception as e:
                 logger.warning(f"解析失败: {filepath}: {e}")
-                failed_files.append({"file": os.path.basename(filepath), "reason": str(e)})
+                failed_files.append({"file": filename, "reason": str(e)})
 
         # 3. 数据清洗
         clean_pages, clean_stats = self._clean_documents(raw_pages, len(files))
         clean_stats.total_raw = len(files)
 
-        # 4. 文本切片
+        # 4. 文本切片（按文件分组，PPT 走一页一切）
         all_chunks: List[ChunkData] = []
+
+        # 按文件分组
+        from collections import defaultdict
+        pages_by_file: Dict[str, list] = defaultdict(list)
         for page in clean_pages:
             source = page.get("_source", "unknown")
-            page_num = page.get("page_number", 0)
-            text = page.get("text", "").strip()
-            if not text:
-                continue
-            raw_chunks = chunker.chunk(text, source=source)
-            for i, raw_chunk in enumerate(raw_chunks):
-                chunk_text = raw_chunk["content"] if isinstance(raw_chunk, dict) else raw_chunk
-                chunk = ChunkData(
-                    chunk_id=f"{hashlib.md5(f'{source}_{page_num}_{i}_{chunk_text[:50]}'.encode()).hexdigest()[:16]}",
-                    content=chunk_text,
-                    source=source,
-                    page_number=page_num,
+            pages_by_file[source].append(page)
+
+        for source, file_pages in pages_by_file.items():
+            doc_type = file_pages[0].get("_doc_type", "") if file_pages else ""
+
+            if doc_type in ("pptx", "ppt"):
+                # PPT：一页一切片
+                raw_chunks = chunker.chunk_with_pages(
+                    [{"text": p.get("text", ""), "page": p.get("page", 1)} for p in file_pages],
+                    source=source, doc_type=doc_type,
                 )
-                all_chunks.append(chunk)
+                for raw_chunk in raw_chunks:
+                    chunk = ChunkData(
+                        chunk_id=raw_chunk["chunk_id"],
+                        content=raw_chunk["content"],
+                        source=source,
+                        page_number=raw_chunk.get("page_number", 0),
+                    )
+                    all_chunks.append(chunk)
+            else:
+                # 其他格式：逐页切片（结构感知）
+                for page in file_pages:
+                    source_name = page.get("_source", "unknown")
+                    page_num = page.get("page", 0)  # file_parser 返回 "page" 字段
+                    text = page.get("text", "").strip()
+                    if not text:
+                        continue
+                    raw_chunks = chunker.chunk(text, source=source_name)
+                    for i, raw_chunk in enumerate(raw_chunks):
+                        chunk_text = raw_chunk["content"] if isinstance(raw_chunk, dict) else raw_chunk
+                        chunk = ChunkData(
+                            chunk_id=f"{hashlib.md5(f'{source_name}_{page_num}_{i}_{chunk_text[:50]}'.encode()).hexdigest()[:16]}",
+                            content=chunk_text,
+                            source=source_name,
+                            page_number=page_num,
+                        )
+                        all_chunks.append(chunk)
 
         # 5. 统计分析
         chunk_stats = self._analyze_chunks(all_chunks)

@@ -12,6 +12,7 @@ from utils.file_parser import FileParser
 from embeddings.chunker import TextChunker
 from embeddings.embedder import EmbeddingClient
 from rag.retriever import VectorRetriever, MultimodalRetriever
+from rag.router import invalidate_doc_titles_cache
 
 logger = get_logger("routes_docs")
 
@@ -106,6 +107,7 @@ async def upload_document(file: UploadFile = File(...)):
 
         # 入库纯文本 Collection
         count = retriever.insert_documents(chunks_list)
+        invalidate_doc_titles_cache()  # 通知路由刷新文档清单
 
         # 双写：多模态 Collection（文本切片 + 文档图片）
         mm_count = 0
@@ -199,6 +201,7 @@ async def upload_documents_batch(files: List[UploadFile] = File(...)):
             # 切片入库
             chunks_list = chunker.chunk_with_pages(pages, source=file.filename or "unknown")
             count = retriever.insert_documents(chunks_list)
+            invalidate_doc_titles_cache()  # 通知路由刷新文档清单
 
             # 双写多模态
             if mm_retriever:
@@ -286,6 +289,7 @@ async def delete_document(filename: str):
     try:
         # 1. 删除向量数据
         count = retriever.delete_by_filename(filename)
+        invalidate_doc_titles_cache()  # 通知路由刷新文档清单
 
         # 1b. 删除多模态向量数据
         mm_count = 0
@@ -334,6 +338,7 @@ async def clear_documents():
         retriever._client.drop_collection(settings.collection_name)
         # 重新初始化
         retriever._ensure_collection()
+        invalidate_doc_titles_cache()  # 通知路由刷新文档清单
 
         # 同时清空多模态 Collection
         if mm_retriever:

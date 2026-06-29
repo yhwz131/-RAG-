@@ -10,19 +10,12 @@ import re
 from typing import List, Dict, Optional
 from config.settings import settings
 from utils.logger import get_logger
+from utils.tokens import estimate_tokens
 
 logger = get_logger("memory")
 
 # 内存中最多保留的会话数，超出后淘汰最旧的
 MAX_IN_MEMORY_SESSIONS = 100
-
-
-def estimate_tokens(text: str) -> int:
-    """估算文本的 token 数"""
-    cn_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
-    en_words = len(re.findall(r'[a-zA-Z]+', text))
-    other_chars = len(re.findall(r'[^\u4e00-\u9fffa-zA-Z]+', text))
-    return int(cn_chars * 2.0 + en_words * 1.3 + other_chars * 0.5)
 
 
 class ConversationMemory:

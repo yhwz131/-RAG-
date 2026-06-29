@@ -2,8 +2,7 @@
 Prompt 模板模块
 统一管理所有 Prompt 模板，供 chain.py 和其他模块引用
 """
-import re
-from typing import List, Dict
+from utils.tokens import estimate_tokens  # noqa: F401 — 供 chain.py 导入
 
 
 # ============================================================================
@@ -73,14 +72,18 @@ CHITCHAT_SYSTEM_PROMPT = """你是一个友好、有趣的 AI 助手。用户正
 
 
 # 通用知识模式系统提示
-GENERAL_SYSTEM_PROMPT = """你是一个知识丰富的 AI 助手。用户正在询问通用知识问题，请用你自身的知识来回答。
+GENERAL_SYSTEM_PROMPT = """你是一个知识问答系统中的 AI 助手。用户正在询问通用知识问题，请用你自身的知识来回答。
+
+身份说明：
+- 你运行在一个知识库问答系统中，系统包含 LangChain 教程、计算机等级考试大纲等文档
+- 当用户问到系统本身（如"你是干嘛的"、"你能回答什么"），请如实介绍系统的知识库能力
+- 当用户问到通用知识问题（如"什么是机器学习"），用你自身的知识回答即可
 
 要求：
 - 直接回答问题，无需引用外部资料
 - 回答准确、清晰、有条理
 - 适当使用 Markdown 格式
-- 不要提及知识库、文档检索等术语
-- 不要说"根据知识库中的信息"，因为这是用你的通用知识在回答
+- 回答通用知识时不要说"根据知识库中的信息"
 """
 
 
@@ -167,20 +170,3 @@ SQL_RESULT_PROMPT = """你是一个数据分析助手。根据用户的原始问
 回答："""
 
 
-
-# ============================================================================
-# Token 估算工具
-# ============================================================================
-
-def estimate_tokens(text: str) -> int:
-    """估算文本的 token 数
-    
-    粗略估算规则：
-    - 中文字符约 2.0 token/字
-    - 英文单词约 1.3 token/词
-    - 标点符号和空白按 0.5 token/字符
-    """
-    cn_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
-    en_words = len(re.findall(r'[a-zA-Z]+', text))
-    other_chars = len(re.findall(r'[^\u4e00-\u9fffa-zA-Z]+', text))
-    return int(cn_chars * 2.0 + en_words * 1.3 + other_chars * 0.5)

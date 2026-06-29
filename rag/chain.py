@@ -16,9 +16,75 @@ from rag.prompt_template import (
     SYSTEM_PROMPT, CHITCHAT_SYSTEM_PROMPT, GENERAL_SYSTEM_PROMPT,
     MULTIMODAL_SYSTEM_PROMPT, SQL_GENERATION_PROMPT, SQL_RESULT_PROMPT, estimate_tokens,
 )
-from rag.router import route_query, QueryType, preprocess_query, CONFIDENCE_THRESHOLD
+from rag.router import route_query, QueryType, preprocess_query, CONFIDENCE_THRESHOLD, is_cross_doc_query, query_decompose
 
 logger = get_logger("chain")
+
+
+def _text_overlap_ratio(a: str, b: str) -> float:
+    """基于字符集合的重叠率（Jaccard 系数），用于检测 overlap 切片重复"""
+    set_a, set_b = set(a), set(b)
+    if not set_a or not set_b:
+        return 0.0
+    return len(set_a & set_b) / len(set_a | set_b)
+
+
+def _dedupe_context(docs: List[Dict], overlap_threshold: float = 0.7) -> List[Dict]:
+    """基于内容重叠率去重，避免 overlap 切片重复占用 token
+    
+    保留先出现的（分数更高的）条目，去掉与已有条目高度重叠的后续条目。
+    """
+    if len(docs) <= 1:
+        return docs
+    unique = []
+    for doc in docs:
+        content = doc.get("content", "")
+        is_dup = False
+        for u in unique:
+            if _text_overlap_ratio(content, u.get("content", "")) > overlap_threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            unique.append(doc)
+    if len(unique) < len(docs):
+        logger.info(f"上下文去重: {len(docs)} → {len(unique)} 条（阈值={overlap_threshold}）")
+    return unique
+
+
+def _reorder_lost_in_middle(docs: List[Dict]) -> List[Dict]:
+    """Lost in the Middle 重排：最重要的放首尾，中间放次重要的
+    
+    LLM 对上下文中间的内容注意力会下降（Lost in the Middle 现象），
+    将最相关的结果放在开头和结尾可以提升整体关注质量。
+    """
+    if len(docs) <= 2:
+        return docs
+    
+    # docs 已按分数降序排列
+    result = [None] * len(docs)
+    # 最相关的放第一位
+    result[0] = docs[0]
+    
+    if len(docs) == 3:
+        result[1] = docs[2]  # 次相关放末尾
+        result[2] = docs[1]  # 中等放中间
+        return result
+    
+    # 交替填充：首位放最高，末尾放次高，然后交替从前往后、从后往前
+    left, right = 1, len(docs) - 1
+    use_left = True
+    doc_idx = 1
+    while doc_idx < len(docs) and left <= right:
+        if use_left:
+            result[left] = docs[doc_idx]
+            left += 1
+        else:
+            result[right] = docs[doc_idx]
+            right -= 1
+        use_left = not use_left
+        doc_idx += 1
+    
+    return [d for d in result if d is not None]
 
 # 枚举型查询模式 — 用户想列出/盘点知识库内容，而非语义搜索
 _ENUM_PATTERNS = [
@@ -81,6 +147,8 @@ class RAGChain:
     def _build_context(self, docs: List[Dict], max_context_tokens: int = 3000) -> str:
         """将检索到的文档构建为上下文字符串（带 token 长度控制）
         
+        流程：排序 → 去重 → Lost in Middle 重排 → 拼接截断
+        
         Args:
             docs: 检索到的文档列表
             max_context_tokens: 上下文最大 token 数（默认 3000）
@@ -89,7 +157,13 @@ class RAGChain:
             return "（无相关参考资料）"
         
         # 按相似度降序排列，确保高相关性内容优先被 LLM 看到
-        docs = sorted(docs, key=lambda d: d.get("score", 0), reverse=True)
+        docs = sorted(docs, key=lambda d: d.get("rerank_score") or d.get("score", 0), reverse=True)
+        
+        # 去重：移除 overlap 切片的重复内容
+        docs = _dedupe_context(docs)
+        
+        # Lost in the Middle 重排：最重要放首尾
+        docs = _reorder_lost_in_middle(docs)
         
         parts = []
         current_tokens = 0
@@ -97,7 +171,7 @@ class RAGChain:
         for i, doc in enumerate(docs, 1):
             source = doc.get("source", "未知来源")
             chunk_index = doc.get("chunk_index", "N/A")
-            score = doc.get("score", 0)
+            score = doc.get("rerank_score") or doc.get("score", 0)
             content = doc.get("content", "")
             page = doc.get("page_number", 0)
             # 构建来源描述
@@ -549,6 +623,24 @@ class RAGChain:
         history = self.memory.get_context(session_id)
         query_type, confidence, route_reason = route_query(query, history=history)
         logger.info(f"查询路由结果: {query_type.value} (置信度={confidence:.2f}, {route_reason})")
+
+        # 跨文档查询覆盖：如果启发式判断为跨文档查询且涉及知识库文档主题，强制走 RAG 路径
+        # 解决 LLM 路由将跨文档查询误判为 general 的问题（如 #29）
+        if query_type == QueryType.GENERAL and is_cross_doc_query(query):
+            # 二次确认：查询中是否提及知识库相关的主题关键词
+            _kb_topic_keywords = [
+                "考试", "大纲", "国考", "考级", "二级", "三级",
+                "python", "信息安全", "网络技术", "网络大纲",
+                "langchain", "小优", "教育", "优必选", "剧本",
+                "核心概念",
+            ]
+            q_lower = query.lower()
+            matched_kw = [kw for kw in _kb_topic_keywords if kw in q_lower]
+            if len(matched_kw) >= 1:
+                query_type = QueryType.RAG
+                route_reason = f"跨文档查询覆盖(原路由: general, 关键词: {matched_kw})"
+                confidence = max(confidence, 0.80)
+                logger.info(f"跨文档查询覆盖: general → rag (关键词: {matched_kw})")
         
         # 意图不明确：直接向用户确认，不浪费检索和 LLM 调用
         if query_type == QueryType.CLARIFICATION:
@@ -593,7 +685,20 @@ class RAGChain:
             logger.info(f"枚举型查询检测命中: {query[:50]}... -> 查元数据")
             return self._handle_enum_query(query, session_id, stream=stream)
         
-        docs = self.retriever.search(retrieval_query)
+        # 1.2 多查询检索：跨文档复合查询拆分子查询分别检索
+        docs = None
+        if settings.multi_query_enabled and is_cross_doc_query(retrieval_query):
+            try:
+                sub_queries = query_decompose(
+                    retrieval_query, max_sub=settings.multi_query_max_sub
+                )
+                if len(sub_queries) >= 2:
+                    docs = self.retriever.multi_search(sub_queries, original_query=retrieval_query, skip_reranker=True)
+                    logger.info(f"多查询检索命中: 拆分为 {len(sub_queries)} 个子查询")
+            except Exception as e:
+                logger.warning(f"多查询检索异常，降级为单查询: {e}")
+        if docs is None:
+            docs = self.retriever.search(retrieval_query)
         
         # 1.5 硬校验：无相关文档或相关度过低时直接返回，不调用 LLM
         if not docs:

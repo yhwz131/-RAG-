@@ -12,6 +12,7 @@ from pymilvus import MilvusClient
 from config.settings import settings
 from utils.logger import get_logger
 from embeddings.embedder import EmbeddingClient, MultimodalEmbedder
+from rag.reranker import Reranker, adaptive_filter
 
 logger = get_logger("retriever")
 
@@ -29,6 +30,7 @@ class VectorRetriever:
         self._bm25_docs: List[Dict] = []  # 缓存文档用于BM25检索
         self._bm25_instance = None  # BM25Okapi 实例缓存
         self._corpus_tokens: List[List[str]] = []  # 分词结果缓存
+        self._reranker = Reranker() if settings.reranker_enabled else None
         self._update_bm25_cache()
 
     def close(self):
@@ -336,14 +338,14 @@ class VectorRetriever:
         return results
     
     def search(self, query: str, top_k: int = None) -> List[Dict]:
-        """混合检索：向量检索 + BM25 + RRF 融合
+        """混合检索：向量检索 + BM25 + RRF 融合 + Reranker 精排
         
         Args:
             query: 查询文本
             top_k: 返回结果数量
         
         Returns:
-            检索结果列表（已过滤低于阈值的结果）
+            检索结果列表
         """
         top_k = top_k or settings.top_k
         candidate_k = top_k * 3  # 扩大候选池
@@ -378,18 +380,143 @@ class VectorRetriever:
                     f"(similarity_threshold={sim_threshold})"
                 )
         
+        # 4. Reranker 精排（cross-encoder 重打分）
+        if self._reranker and fused_results:
+            fused_results = self._reranker.rerank(query, fused_results, top_k=top_k)
+            # 相对阈值过滤
+            fused_results = adaptive_filter(fused_results)
+        
         results = fused_results[:top_k]
         logger.info(f"检索完成: 向量={len(vector_results)}, 关键词={len(keyword_results)}, 最终={len(results)}")
         # 调试日志：打印最终结果详情
         for i, r in enumerate(results):
+            score_key = "rerank_score" if "rerank_score" in r else "score"
             logger.info(
                 f"  [{i+1}] 来源={r.get('source', '?')}, "
                 f"页码={r.get('page_number', 0)}, "
-                f"分数={r.get('score', 0):.4f}, "
+                f"分数={r.get(score_key, 0):.4f}, "
                 f"类型={r.get('source_type', '?')}"
             )
         return results
     
+    def multi_search(self, queries: List[str], original_query: str = "", top_k: int = None, skip_reranker: bool = False) -> List[Dict]:
+        """多查询检索：对每个子查询独立检索，合并去重后统一重排
+
+        用于跨文档查询——拆分为多个聚焦子查询分别检索，
+        避免单个查询 embedding 被主导话题"吃掉"。
+
+        Args:
+            queries: 子查询列表
+            original_query: 原始查询（用于 reranker 重排）
+            top_k: 最终返回数量
+            skip_reranker: 是否跳过 reranker（跨文档场景用 RRF+多样性代替，
+                避免 reranker 偏向主查询主题导致次要主题文档被排挤）
+
+        Returns:
+            合并去重后的检索结果
+        """
+        top_k = top_k or settings.top_k
+        candidate_k = top_k * 4  # 子查询各取更多候选，合并后再截断
+
+        # 分别对每个子查询做 RRF 融合，然后合并
+        all_fused = []
+        for i, q in enumerate(queries):
+            logger.info(f"  子查询[{i+1}]: {q}")
+            vec_res = self._vector_search(q, top_k=candidate_k)
+            kw_res = self._bm25_search(q, top_k=candidate_k)
+            if kw_res:
+                fused = self._rrf_fusion(vec_res, kw_res)
+            else:
+                fused = vec_res
+            logger.info(f"    子查询[{i+1}] 候选: vec={len(vec_res)}, kw={len(kw_res)}, fused={len(fused)}")
+            all_fused.extend(fused)
+
+        # 全局去重：按 chunk_id 去重，保留最高分
+        seen = {}
+        for doc in all_fused:
+            key = doc.get("chunk_id") or doc.get("content", "")[:100]
+            if key not in seen or doc.get("score", 0) > seen[key].get("score", 0):
+                seen[key] = doc
+        merged = list(seen.values())
+        merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+        logger.info(f"    去重详情: {len(all_fused)} → {len(merged)} unique keys")
+        for i, m in enumerate(merged[:8]):
+            logger.info(f"      [{i+1}] {m.get('source','?')} key={m.get('chunk_id','')[:20] or m.get('content','')[:30]} score={m.get('score',0):.4f}")
+
+        # Reranker 精排
+        # 跨文档场景跳过 reranker：用 RRF 分数 + 来源多样性代替
+        # 原因：reranker 用原始查询打分时偏向主查询主题，次要主题文档被排挤
+        if not skip_reranker:
+            rerank_query = original_query or queries[0]
+            if self._reranker and merged:
+                merged = self._reranker.rerank(rerank_query, merged, top_k=top_k * 3)
+        else:
+            logger.info("  跨文档模式：跳过 reranker，使用 RRF+多样性")
+
+        # 保证来源多样性：优先从不同文档中取结果
+        results = self._diversify_by_source(merged, top_k)
+        logger.info(
+            f"多查询检索完成: {len(queries)} 个子查询, "
+            f"融合候选={len(all_fused)}, 去重后={len(merged)}, 最终={len(results)}"
+        )
+        for i, r in enumerate(results):
+            score_key = "rerank_score" if "rerank_score" in r else "score"
+            logger.info(
+                f"  [{i+1}] 来源={r.get('source', '?')}, "
+                f"页码={r.get('page_number', 0)}, "
+                f"分数={r.get(score_key, 0):.4f}"
+            )
+        return results
+
+    @staticmethod
+    def _diversify_by_source(sorted_docs: List[Dict], top_k: int) -> List[Dict]:
+        """保证来源多样性的选取策略。
+
+        对于跨文档查询，reranker 可能把来自同一文档的所有切片排在前面，
+        导致返回结果全是同一份文档。此方法在选取时优先从不同来源中各取一条，
+        确保 MQR 拆分出的每个子查询对应的文档都有机会出现在最终结果中。
+
+        Args:
+            sorted_docs: 已按 rerank_score 降序排列的文档列表
+            top_k: 最终返回数量
+
+        Returns:
+            来源多样化的 top_k 条结果
+        """
+        if len(sorted_docs) <= top_k:
+            return sorted_docs
+
+        # 按 source 分组，保持组内 rerank_score 顺序
+        from collections import defaultdict
+        by_source: Dict[str, List[Dict]] = defaultdict(list)
+        for doc in sorted_docs:
+            src = doc.get("source", "未知")
+            by_source[src].append(doc)
+
+        sources = list(by_source.keys())
+        results = []
+        seen_sources_round = set()  # 当前轮次已选的来源
+
+        # 轮询选取：每轮从每个来源中各取一条（跳过已耗尽的来源）
+        round_idx = 0
+        while len(results) < top_k:
+            added = False
+            for src in sources:
+                if len(results) >= top_k:
+                    break
+                if round_idx < len(by_source[src]):
+                    results.append(by_source[src][round_idx])
+                    added = True
+            round_idx += 1
+            if not added:
+                break  # 所有来源都已耗尽
+
+        logger.debug(
+            f"来源多样化: {len(sorted_docs)} → {len(results)} "
+            f"({len(sources)} 个来源, {[f'{s}×{len(by_source[s])}' for s in sources]})"
+        )
+        return results
+
     def delete_by_doc_id(self, doc_id: str) -> int:
         """根据文档ID删除所有相关切片"""
         try:
@@ -460,6 +587,9 @@ class MultimodalRetriever:
         self._connect()
         self._ensure_collection()
         self._bm25_docs: List[Dict] = []
+        self._bm25_instance = None  # BM25Okapi 实例缓存
+        self._corpus_tokens: List[List[str]] = []  # 分词结果缓存
+        self._reranker = Reranker() if settings.reranker_enabled else None
         # 图片描述 LLM 专用连接池（复用连接，避免每次调用新建）
         self._mm_llm_client = httpx.Client(
             timeout=30,
@@ -528,10 +658,21 @@ class MultimodalRetriever:
                     break
                 offset += batch_size
             self._bm25_docs = all_results
+            # 构建 BM25 实例（分词 + 构建一次性完成）
+            try:
+                import jieba
+                from rank_bm25 import BM25Okapi
+                self._corpus_tokens = [list(jieba.cut(doc.get("content", ""))) for doc in self._bm25_docs]
+                self._bm25_instance = BM25Okapi(self._corpus_tokens)
+            except ImportError:
+                logger.warning("jieba/rank_bm25 未安装，多模态 BM25 检索不可用")
+                self._bm25_instance = None
             logger.info(f"多模态 BM25 缓存更新完成: {len(self._bm25_docs)} 条")
         except Exception as e:
             logger.warning(f"多模态 BM25 缓存更新失败: {e}")
             self._bm25_docs = []
+            self._bm25_instance = None
+            self._corpus_tokens = []
 
     def insert_documents(self, chunks: List[Dict]) -> int:
         """将文档切片插入多模态 Collection
@@ -894,7 +1035,13 @@ class MultimodalRetriever:
                     f"(similarity_threshold={sim_threshold})"
                 )
 
-        # 4. 文件来源去重：同一文件只保留分数最高的 1 条
+        # 4. Reranker 精排（cross-encoder 重打分）
+        if self._reranker and fused_results:
+            fused_results = self._reranker.rerank(query, fused_results, top_k=top_k * 2)
+            # 相对阈值过滤
+            fused_results = adaptive_filter(fused_results)
+
+        # 5. 文件来源去重：同一文件只保留分数最高的 1 条
         seen_files: set[str] = set()
         vector_docs = []
         for doc in fused_results:
@@ -912,10 +1059,11 @@ class MultimodalRetriever:
             f"最终={len(vector_docs)}"
         )
         for i, r in enumerate(vector_docs):
+            score_key = "rerank_score" if "rerank_score" in r else "score"
             logger.info(
                 f"  [{i+1}] 来源={r.get('source', '?')}, "
                 f"页码={r.get('page_number', 0)}, "
-                f"分数={r.get('score', 0):.4f}, "
+                f"分数={r.get(score_key, 0):.4f}, "
                 f"类型={r.get('source_type', '?')}, "
                 f"has_image={r.get('has_image', False)}"
             )
@@ -923,16 +1071,12 @@ class MultimodalRetriever:
 
     def _bm25_search(self, query: str, top_k: int = 5) -> List[Dict]:
         """BM25 关键词检索（使用缓存的 BM25 实例，仅分词查询）"""
-        if not self._bm25_docs:
+        if not self._bm25_docs or self._bm25_instance is None:
             return []
         try:
-            from rank_bm25 import BM25Okapi
             import jieba
-
-            corpus_tokens = [list(jieba.cut(doc.get("content", ""))) for doc in self._bm25_docs]
-            bm25 = BM25Okapi(corpus_tokens)
             query_tokens = list(jieba.cut(query))
-            scores = bm25.get_scores(query_tokens)
+            scores = self._bm25_instance.get_scores(query_tokens)
 
             import numpy as np
             top_indices = np.argsort(scores)[::-1][:top_k]
